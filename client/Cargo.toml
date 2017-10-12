@@ -1,0 +1,20 @@
+[package]
+name = "flashvnc"
+version = "0.1.0"
+authors = ["Patrick Plagwitz <Patrick_Plagwitz@web.de>"]
+
+[dependencies]
+gtk = "0.1.3"
+gdk = "0.5.3"
+gdk-pixbuf = "0.1.3"
+glib = "0.1.3"
+# this a dependency of only server_test_program and listed here
+# due to a limitation in Cargo
+# TODO remove this
+libc = "0.2"
+derivative = "*"
+
+[dev-dependencies]
+libc = "0.2"
+tempdir = "0.3.5"
+spectral = "0.6.0"
