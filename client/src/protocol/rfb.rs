@@ -89,6 +89,11 @@ packet! { ServerInit:
     [name : [dep(length(u32_be()), utf8())] -> String]
 }
 
+packet! { SetPixelFormat:
+    [ignored : [ignored(3)] -> ()]
+    [format : [PixelFormat::parser()] -> PixelFormat]
+}
+
 packet! { SetEncodings:
     [ignored : [ignored(1)] -> ()]
     [encodings : [prefix_len_array(u16_be(), i32_be())] -> Vec<i32>]
@@ -109,6 +114,7 @@ packet! { PointerEvent:
 }
 
 tagged_meta_packet! { ClientToServer: u8p() => u8 =>
+    [0] SetPixelFormat,
     [2] SetEncodings,
     [3] FramebufferUpdateRequest,
     [5] PointerEvent

@@ -81,7 +81,6 @@ pub trait Packet : Sized {
     fn name() -> &'static str;
 }
 
-//TODO only pass reference to parser here
 pub fn io_parse<P, I>(parser : &P, buffer : &SharedBuf, input : I) 
     -> ParseEndResult<P::T>
     where P : Parser,

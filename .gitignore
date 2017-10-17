@@ -2,7 +2,7 @@
 **/*.rs.bk
 *.swp
 *.un~
-/TODO
+/TODO*
 /concept-*
-/Session*.vim
+Session*.vim
 target/

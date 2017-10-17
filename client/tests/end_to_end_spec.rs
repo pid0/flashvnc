@@ -1,244 +1,47 @@
 extern crate libc;
 extern crate tempdir;
+extern crate cairo;
 
-use std::process::{Command,Child,ExitStatus};
-use std::io;
-use std::fs::{File,OpenOptions};
-use std::path::{Path,PathBuf};
-use std::ffi::CString;
+#[allow(dead_code)]
+mod benchmark;
+use benchmark::common::end_to_end::*;
+use std::time::Duration;
 use tempdir::TempDir;
-use std::time::{Instant,Duration};
 
-use io::{BufRead,Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::process::Command;
 
-const VNC_START_PORT : u32 = 5900;
+use std::fs::{File,remove_dir_all,DirBuilder};
+use std::path::Path;
 
-fn system_decode(bytes : Vec<u8>) -> Option<String> {
-    match String::from_utf8(bytes) {
-        Ok(string) => Some(string),
-        Err(_) => None
-    }
+fn write_test_image_to(path : &Path) {
+    let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, 
+                                              TEST_FB_WIDTH as i32, 
+                                              TEST_FB_HEIGHT as i32).unwrap();
+    let (width, height) = (TEST_FB_WIDTH as f64, TEST_FB_HEIGHT as f64);
+    let cr = cairo::Context::new(&surface);
+    cr.set_source_rgb(1.0, 0.0, 0.0);
+    cr.rectangle(0.0, 0.0, width / 2.0, height);
+    cr.fill();
+
+    cr.set_source_rgb(0.2, 0.7, 1.0);
+    cr.rectangle(width / 2.0, 0.0, width / 2.0, height);
+    cr.fill();
+
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.rectangle(0.0, height - 10.0, width, 10.0);
+    cr.fill();
+    surface.write_to_png(&mut File::create(path).unwrap()).unwrap();
 }
 
-fn as_c_string(path : &Path) -> CString {
-    CString::new(path.as_os_str().as_bytes()).unwrap()
-}
-
-fn in_project_dir(path : &str) -> PathBuf {
-    let mut ret = PathBuf::from("./");
-    ret.push(path);
-    ret
-}
-fn abspath(path : &Path) -> PathBuf {
-    let mut ret = PathBuf::new();
-    ret.push(std::env::current_dir().unwrap());
-    ret.push(path);
-    ret
-}
-fn project_binary(name : &str) -> PathBuf {
-    abspath(&in_project_dir(&format!("target/debug/{}", name)))
-}
-
-struct Server {
-    port : u32,
-    process : Child,
-    test_program_pid : u32, 
-    input : File,
-    output : io::BufReader<File>
-}
-impl Server {
-    fn start(temp_dir : &TempDir) -> io::Result<Self> {
-        let (process_in, process_out) = Self::make_fifos(temp_dir)?;
-        let startup_file_path = temp_dir.path().join("xstartup");
-        Self::write_startup_file(&startup_file_path, &process_in, 
-                                 &process_out)?;
-
-        let process = Command::new("vncserver")
-            .args(&["-fg", "-securitytypes", "none", "-xstartup"])
-            .arg(startup_file_path)
-            .spawn()?;
-
-        let vnc_screen : u32;
-        loop {
-            let latest_vnc_screen = in_project_dir("latest-vnc-screen.sh");
-            let output = Command::new(latest_vnc_screen).output()?;
-            if output.stdout.len() > 0 {
-                vnc_screen = system_decode(output.stdout.clone())
-                    .unwrap().trim().parse().unwrap();
-                break;
-            }
-        }
-
-        let input = OpenOptions::new().write(true).open(process_in)?;
-        let mut output = io::BufReader::new(
-            OpenOptions::new().read(true).open(process_out)?);
-        let mut line = String::new();
-        output.read_line(&mut line).unwrap();
-
-        Ok(Server {
-            port: VNC_START_PORT + vnc_screen,
-            process: process,
-            test_program_pid: line.trim().parse().unwrap(),
-            input: input,
-            output: output,
-        })
-    }
-
-    fn write_startup_file(startup_file_path : &Path, 
-                          process_in : &Path, 
-                          process_out : &Path) -> io::Result<()> {
-        let test_program_path = project_binary("server_test_program");
-        let mut startup_file = OpenOptions::new().create(true).write(true)
-            .mode(0o700)
-            .open(&startup_file_path)?;
-        startup_file.write_all(b"#!/usr/bin/env bash\n")?;
-        startup_file.write_all(b"exec ")?;
-        startup_file.write_all(test_program_path.as_os_str().as_bytes())?;
-        startup_file.write_all(b" <")?;
-        startup_file.write_all(process_in.as_os_str().as_bytes())?;
-        startup_file.write_all(b" >")?;
-        startup_file.write_all(process_out.as_os_str().as_bytes())?;
-        Ok(())
-    }
-
-    fn make_fifos(temp_dir : &TempDir) -> io::Result<(PathBuf, PathBuf)> {
-        let input_fifo_path = temp_dir.path().join("input");
-        let output_fifo_path = temp_dir.path().join("output");
-
-        unsafe {
-            assert_eq!(libc::mkfifo(
-                    as_c_string(&input_fifo_path).as_ptr(), 0o600), 0);
-            assert_eq!(libc::mkfifo(
-                    as_c_string(&output_fifo_path).as_ptr(), 0o600), 0);
-        }
-
-        Ok((input_fifo_path.to_path_buf(), output_fifo_path.to_path_buf()))
-    }
-
-    fn port(&self) -> u32 {
-        self.port
-    }
-
-    fn event_matches(event : &str, expected_type : &str, 
-                     expected_params : &[&str]) -> bool {
-        let words : Vec<&str> = event.split_whitespace().collect();
-        if words[0] != expected_type {
-            return false;
-        }
-        expected_params.iter().all(|param| words.contains(param))
-    }
-
-    fn is_heartbeat_line(line : &str) -> bool {
-        line.trim().len() == 0
-    }
-
-    fn should_have_received_event(&mut self, event_type : &str, 
-                                  expected_params : &[&str],
-                                  timeout : Option<Duration>) {
-        let timeout = match timeout {
-            Some(t) => t,
-            None => Duration::from_millis(200)
-        };
-
-        let mut line = String::new();
-        let start_time = Instant::now();
-        loop {
-            self.output.read_line(&mut line).unwrap();
-            if Instant::now().duration_since(start_time) > timeout {
-                assert!(false, "timed out");
-            }
-            if !Self::is_heartbeat_line(&line) {
-                break;
-            }
-        }
-
-        assert!(Self::event_matches(&line, event_type, expected_params),
-            line);
-    }
-
-    fn change_screen_size(&mut self, width : u32, height : u32) {
-        writeln!(self.input, "change-screen-size {}x{}", width, height)
-            .unwrap();
-    }
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.test_program_pid as i32, libc::SIGTERM);
-        }
-        self.process.wait().unwrap();
-    }
-}
-
-struct Client {
-    process : Child
-}
-impl Client {
-    fn start(host : &str, port : u32) -> io::Result<Self> {
-        let client_path = project_binary("flashvnc");
-        let process = Command::new(client_path)
-            .arg(format!("{}:{}", host, port))
-            .spawn()?;
-
-        assert!(Self::call_atspi_with_id(process.id(), &["wait"]).success(),
-            "no client");
-
-        Ok(Client {
-            process: process
-        })
-    }
-
-    fn call_atspi(&self, args : &[&str]) -> ExitStatus {
-        Self::call_atspi_with_id(self.process.id(), args)
-    }
-    fn call_atspi_with_id(pid : u32, args : &[&str]) -> ExitStatus {
-        let atspi_script = in_project_dir("atspi.py");
-        Command::new(atspi_script)
-            .arg(format!("{}", pid))
-            .args(args)
-            .status().expect("failed to start AT-SPI script")
-    }
-
-    fn interact(&self, args : &[&str]) {
-        assert!(self.call_atspi(args).success(), "AT-SPI interaction");
-    }
-    fn query(&self, args : &[&str]) -> bool {
-        let code = self.call_atspi(args).code();
-        if code == Some(3) {
-            true
-        } else if code == Some(4) {
-            false
-        } else {
-            panic!("AT-SPI failed");
-        }
-    }
-
-    fn press_mouse(&self, button : u32, x : u32, y : u32) {
-        self.interact(&["mouse", &format!("b{}p", button),
-                      &format!("{}", x), &format!("{}", y)]);
-    }
-
-    fn should_have_screen_with_size(&self, width : u32, height : u32) {
-        assert!(self.query(&["query-screen-size",
-                   &format!("{}", width),
-                   &format!("{}", height)]));
-    }
-}
-impl Drop for Client {
-    fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.process.id() as i32, libc::SIGTERM);
-        }
-        self.process.wait().unwrap();
-    }
-}
-
+//next: start not simultaneously OR in Xephyr
+//      until then: run with target/debug/end_to_end_spec-2820d5f4ff10fef9 --test-threads=1
+//then: benchmark animation looks (and is) much slower than test program
+//      excessive queuing in client or in server?
+//      fps display is also kind of borked: with 10ms delay, it shows 20 fps but this isn't true
 #[test]
 fn should_communicate_bidirectionally_with_a_vnc_server() {
     let temp_dir = TempDir::new("flashvnc").unwrap();
-    let mut server = Server::start(&temp_dir).unwrap();
+    let mut server = Server::start(temp_dir.path()).unwrap();
     let client = Client::start("localhost", server.port()).unwrap();
 
     client.press_mouse(1, 54, 50);
@@ -246,6 +49,31 @@ fn should_communicate_bidirectionally_with_a_vnc_server() {
                                       "x_root=54", "y_root=50"], None);
 
     server.change_screen_size(1152, 864);
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(600));
     client.should_have_screen_with_size(1152, 864);
+}
+
+#[test]
+fn should_show_the_rfb_if_the_client_is_a_still_image() {
+    //TODO insecure way of creating a tempdir, but Rust is too shitty to have mktemp
+    let temp_dir = ::std::env::temp_dir().join("flashvnc-still-image");
+    remove_dir_all(&temp_dir).unwrap_or(());
+    DirBuilder::new().create(&temp_dir).unwrap();
+
+    let reference = temp_dir.join("reference.png");
+    let actual = temp_dir.join("actual.png");
+    let diff = temp_dir.join("diff.png");
+    write_test_image_to(&reference);
+
+    let mut server = Server::start(&temp_dir).unwrap();
+    server.show_still_image(&reference);
+    let client = Client::start("localhost", server.port()).unwrap();
+
+    std::thread::sleep(Duration::from_millis(600));
+    client.take_screenshot(&actual);
+
+    assert!(Command::new("compare")
+        .args(&["-metric", "PSNR"])
+        .args(&[reference, actual, diff])
+        .status().unwrap().success());
 }

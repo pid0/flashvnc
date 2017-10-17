@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
-import sys, time
+import sys, time, subprocess
 
 import gi
 gi.require_version("Atspi", "2.0") 
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk
 from gi.repository import Atspi
 
 TIMEOUT_IN_S = 4
@@ -16,6 +18,19 @@ def query_return_code(boolean):
 
 def eprint(*args):
   print(*args, file=sys.stderr)
+
+def generate_mouse_event(x, y, kind):
+  #return Atspi.generate_mouse_event(x, y, kind)
+  action = {
+      "c": "click",
+      "p": "mousedown",
+      "r": "mouseup"
+  }[kind[2]]
+  button = kind[1]
+
+  if subprocess.run(["xdotool", "mousemove", str(x), str(y)]).returncode != 0:
+    return False
+  return subprocess.run(["xdotool", action, button]).returncode == 0
 
 def visit(obj, func):
   func(obj)
@@ -102,7 +117,7 @@ def main(argv):
   drawing_area.grab_focus()
 
   if command == "mouse":
-    return Atspi.generate_mouse_event(
+    return generate_mouse_event(
         screen_extents.x + int(command_args[1]),
         screen_extents.y + int(command_args[2]),
         command_args[0])
@@ -111,6 +126,13 @@ def main(argv):
     return query_return_code(
       window_extents.width == int(command_args[0]) and
       window_extents.height == int(command_args[1]))
+  elif command == "take-screenshot":
+    dest = command_args[0]
+    screen = Gdk.get_default_root_window()
+    pixbuf = Gdk.pixbuf_get_from_window(screen, 
+        screen_extents.x, screen_extents.y,
+        screen_extents.width, screen_extents.height)
+    pixbuf.savev(dest, "png", [], [])
   else:
     eprint("no such command")
     return 2

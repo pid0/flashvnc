@@ -56,8 +56,8 @@ impl flashvnc::View for View {
 }
 
 struct Client {
-    socket: TcpStream,
-    thread: JoinHandle<Result<(), String>>,
+    socket : TcpStream,
+    thread : JoinHandle<Result<(), flashvnc::MainError>>,
     _gui_events : mpsc::Sender<flashvnc::GuiEvent>,
     _server_port : u32
 }
@@ -71,7 +71,10 @@ impl Client {
         };
         let thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            flashvnc::socket_thread_main(&server_string(port), view)
+            flashvnc::socket_thread_main(flashvnc::ConnectionConfig {
+                host_and_port: server_string(port),
+                benchmark: false
+            }, view)
         });
 
         let server = TcpListener::bind(&server_string(port)).unwrap();
@@ -88,7 +91,7 @@ impl Client {
 
     fn should_exit_with_error(self) -> String {
         self.thread.join().expect("should not panic")
-            .expect_err("should exit with error")
+            .expect_err("should exit with error").0
     }
     fn join(self) {
         self.socket.shutdown(Shutdown::Both).unwrap();
@@ -179,7 +182,10 @@ fn should_stop_and_output_an_error_if_it_cant_write_to_the_server() {
     let view = View {
         events_in: rx
     };
-    let error_message = flashvnc::handle_connection(client, view).unwrap_err();
+    let error_message = flashvnc::handle_connection(flashvnc::ConnectionConfig {
+            host_and_port: String::new(),
+            benchmark: false
+        }, client, view).unwrap_err().0;
     assert_that!(error_message.to_lowercase()).contains("connection");
     assert_that!(error_message.to_lowercase()).contains("can't write");
     assert!(!error_message.contains("{"));

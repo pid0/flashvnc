@@ -2,14 +2,24 @@ use std::process::Command;
 
 extern crate gtk;
 extern crate gdk;
+extern crate gdk_pixbuf;
 //extern crate glib;
 extern crate libc;
+extern crate cairo;
+
+use cairo::Gradient;
 
 use gtk::WidgetExt;
 use gtk::WindowExt;
+use gdk::WindowExt as GdkWindowExt;
+use gdk::ContextExt;
 use gtk::ContainerExt;
 
+use gdk_pixbuf::Pixbuf;
+
 use std::io;
+use std::cell::RefCell;
+use std::sync::{Arc,Mutex};
 
 fn set_expand<T : gtk::WidgetExt>(widget : &T) {
     widget.set_hexpand(true);
@@ -37,7 +47,9 @@ fn handle_input(_widget : &gtk::DrawingArea, e : &gdk::EventButton)
     gtk::Inhibit(true)
 }
 
-fn serve() {
+fn serve(benchmark_mode : Arc<Mutex<bool>>, 
+         image_file_path : Arc<Mutex<String>>)
+{
         //std::thread::sleep(std::time::Duration::from_secs(1));
     let mut line = String::new();
     let stdin = io::stdin();
@@ -52,6 +64,13 @@ fn serve() {
                     .args(&["-s", words[1]])
                     .status()
                     .expect("xrandr");
+            }
+            "show-benchmark" => {
+                *benchmark_mode.lock().unwrap() = true;
+            }
+            "show-image" => {
+                //TODO use rest of words
+                *image_file_path.lock().unwrap() = String::from(words[1]);
             }
             _ => { 
                 unimplemented!()
@@ -76,17 +95,81 @@ fn main() {
     set_expand(&area);
     window.add(&area);
 
+    struct Animation {
+        forwards : bool,
+        center_pos : f64
+    }
+    struct DrawData {
+        animation : RefCell<Animation>,
+        image : RefCell<Option<Pixbuf>>
+    }
+    let data = DrawData {
+        animation: RefCell::new(Animation {
+            forwards: true,
+            center_pos: 0.0
+        }),
+        image: RefCell::new(None)
+    };
+
+    let benchmark_mode = Arc::new(Mutex::new(false));
+    let image_file_path = Arc::new(Mutex::new(String::new()));
+    let benchmark_mode_clone = benchmark_mode.clone();
+    let image_file_path_clone = image_file_path.clone();
+
     area.connect_draw(move |ref area, ref cr| {
         let width = area.get_allocated_width() as f64;
         let height = area.get_allocated_height() as f64;
-        cr.set_source_rgb(1.0, 0.0, 0.0);
-        cr.rectangle(0.0, 0.0, width / 2.0, height);
+//        cr.set_source_rgb(1.0, 0.0, 0.0);
+//        cr.rectangle(0.0, 0.0, width / 2.0, height);
+//        cr.fill();
+//        cr.set_source_rgb(0.0, 1.0, 0.0);
+//        cr.rectangle(width / 2.0, 0.0, width / 2.0, height);
+//        cr.fill();
+
+        if image_file_path.lock().unwrap().len() > 0 {
+            let mut image = data.image.borrow_mut();
+            if image.is_none() {
+                *image = Some(Pixbuf::new_from_file(
+                         &image_file_path.lock().unwrap()).unwrap());
+            }
+            cr.set_source_pixbuf(image.as_ref().unwrap(), 0.0, 0.0);
+            cr.rectangle(0.0, 0.0, width, height);
+            cr.fill();
+            return gtk::Inhibit(true);
+        }
+
+        let mut animation = data.animation.borrow_mut();
+
+        let gradient = cairo::LinearGradient::new(0.0, 0.0, width, 0.0);
+        gradient.add_color_stop_rgb(0.0, 1.0, 1.0, 1.0);
+        gradient.add_color_stop_rgb(animation.center_pos, 0.0, 0.0, 1.0);
+        gradient.add_color_stop_rgb(1.0, 1.0, 1.0, 1.0);
+        cr.set_source(&gradient);
+        cr.rectangle(0.0, 0.0, width, height);
         cr.fill();
-        cr.set_source_rgb(0.0, 1.0, 0.0);
-        cr.rectangle(width / 2.0, 0.0, width / 2.0, height);
-        cr.fill();
+
+        if *benchmark_mode.lock().unwrap() {
+            //::std::thread::sleep(::std::time::Duration::from_millis(10));
+            eprintln!("animation pos: {}", animation.center_pos);
+            if animation.forwards {
+                animation.center_pos += 0.009;
+                if animation.center_pos >= 1.0 {
+                    animation.forwards = false;
+                }
+            } else {
+                animation.center_pos -= 0.009;
+                if animation.center_pos <= 0.0 {
+                    animation.forwards = true;
+                }
+            }
+            area.queue_draw();
+        }
         gtk::Inhibit(true)
     });
+//    glib::timeout_add(50, move || {
+//        area_clone.queue_draw();
+//        glib::Continue(true)
+//    });
 
     area.connect_button_press_event(|ref widget, ref e| {
         handle_input(widget, e)
@@ -105,7 +188,9 @@ fn main() {
 
     println!("{}", unsafe { libc::getpid() });
 
-    std::thread::spawn(serve);
+    std::thread::spawn(move || { 
+        serve(benchmark_mode_clone, image_file_path_clone)
+    });
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
