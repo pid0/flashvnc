@@ -3,23 +3,27 @@ use std::process::Command;
 extern crate gtk;
 extern crate gdk;
 extern crate gdk_pixbuf;
-//extern crate glib;
+extern crate glib;
 extern crate libc;
 extern crate cairo;
 
 use cairo::Gradient;
 
-use gtk::WidgetExt;
-use gtk::WindowExt;
+use gtk::{WidgetExt,WindowExt,ContainerExt};
 use gdk::WindowExt as GdkWindowExt;
-use gdk::ContextExt;
-use gtk::ContainerExt;
+use gdk::{ContextExt,DisplayExt,SeatExt,DeviceExt};
 
 use gdk_pixbuf::Pixbuf;
 
 use std::io;
 use std::cell::RefCell;
 use std::sync::{Arc,Mutex};
+use std::str::FromStr;
+
+struct CursorPos {
+    x : u32,
+    y : u32
+}
 
 fn set_expand<T : gtk::WidgetExt>(widget : &T) {
     widget.set_hexpand(true);
@@ -48,12 +52,14 @@ fn handle_input(_widget : &gtk::DrawingArea, e : &gdk::EventButton)
 }
 
 fn serve(benchmark_mode : Arc<Mutex<bool>>, 
-         image_file_path : Arc<Mutex<String>>)
+         image_file_path : Arc<Mutex<String>>,
+         cursor_pos : Arc<Mutex<CursorPos>>)
 {
         //std::thread::sleep(std::time::Duration::from_secs(1));
     let mut line = String::new();
     let stdin = io::stdin();
     loop {
+        line.clear();
         stdin.read_line(&mut line).unwrap();
         let words : Vec<&str> = line.split_whitespace().collect();
         
@@ -71,6 +77,32 @@ fn serve(benchmark_mode : Arc<Mutex<bool>>,
             "show-image" => {
                 //TODO use rest of words
                 *image_file_path.lock().unwrap() = String::from(words[1]);
+            }
+            "query-screen-size" => {
+                let width = Command::new("./screen-size.sh")
+                    .arg("Width")
+                    .output().unwrap().stdout;
+                let width = String::from_utf8(width).unwrap();
+                let height = Command::new("./screen-size.sh")
+                    .arg("Height")
+                    .output().unwrap().stdout;
+                let height = String::from_utf8(height).unwrap();
+                println!("{} {}", width.trim(), height.trim());
+            }
+            "query-mouse-position" => {
+                let pos = cursor_pos.lock().unwrap();
+                println!("{} {}", pos.x, pos.y);
+            }
+            "set-mouse-position" => {
+                let (x, y) = (i32::from_str(words[1]).unwrap(),
+                              i32::from_str(words[2]).unwrap());
+                glib::idle_add(move || {
+                    let display = gdk::Display::get_default().unwrap();
+                    let seat = display.get_default_seat().unwrap();
+                    let mouse = seat.get_pointer().unwrap();
+                    mouse.warp(&display.get_default_screen(), x, y);
+                    glib::Continue(false)
+                });
             }
             _ => { 
                 unimplemented!()
@@ -113,8 +145,10 @@ fn main() {
 
     let benchmark_mode = Arc::new(Mutex::new(false));
     let image_file_path = Arc::new(Mutex::new(String::new()));
+    let cursor_pos = Arc::new(Mutex::new(CursorPos { x: 0, y: 0 }));
     let benchmark_mode_clone = benchmark_mode.clone();
     let image_file_path_clone = image_file_path.clone();
+    let cursor_pos_clone = cursor_pos.clone();
 
     area.connect_draw(move |ref area, ref cr| {
         let width = area.get_allocated_width() as f64;
@@ -177,11 +211,18 @@ fn main() {
     area.connect_button_release_event(|ref widget, ref e| {
         handle_input(widget, e)
     });
-    //TODO key press/release
+    area.connect_motion_notify_event(move |ref _widget, ref e| {
+        let (x, y) = e.get_position();
+        let mut pos = cursor_pos.lock().unwrap();
+        pos.x = x as u32;
+        pos.y = y as u32;
+        gtk::Inhibit(false)
+    });
     let mut event_mask = gdk::EventMask::from_bits_truncate(
         area.get_events() as u32);
     event_mask.insert(gdk::BUTTON_PRESS_MASK);
     event_mask.insert(gdk::BUTTON_RELEASE_MASK);
+    event_mask.insert(gdk::POINTER_MOTION_MASK);
     area.set_events(event_mask.bits() as i32);
 
     window.set_size_request(800, 600);
@@ -189,7 +230,7 @@ fn main() {
     println!("{}", unsafe { libc::getpid() });
 
     std::thread::spawn(move || { 
-        serve(benchmark_mode_clone, image_file_path_clone)
+        serve(benchmark_mode_clone, image_file_path_clone, cursor_pos_clone)
     });
     std::thread::spawn(|| {
         loop {

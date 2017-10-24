@@ -1,4 +1,4 @@
-use protocol::parsing::primitive::{u8p,pred,utf8_with_len,dep,length,prefix_len_array,u32_be,utf8,non_zero,literal,u8_bool,u16_be,ignored,i32_be,nothing};
+use protocol::parsing::primitive::{u8p,seq,conv,pred,utf8_with_len,dep,length,prefix_len_array,u32_be,utf8,non_zero,literal,u8_bool,u16_be,ignored,i32_be,nothing};
 
 pub const PROTOCOL_VERSION_LEN : usize = 12;
 
@@ -18,6 +18,10 @@ const SEC_RESULT_FAILED : u32 = 1;
 pub const ENCODING_RAW : i32 = 0;
 pub const ENCODING_TIGHT : i32 = 7;
 pub const ENCODING_DESKTOP_SIZE : i32 = -223;
+pub const ENCODING_CURSOR : i32 = -239;
+pub const ENCODING_EXTENDED_DESKTOP_SIZE : i32 = -308;
+
+pub const EXTENDED_DESKTOP_NO_ERROR : usize = 0;
 
 fn is_security_type(&number : &u8) -> bool {
     number == SEC_TYPE_NONE
@@ -82,8 +86,8 @@ packet! { PixelFormat:
 }
 
 packet! { ServerInit:
-    [width : [u16_be()] -> u16]
-    [height : [u16_be()] -> u16]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
     [pixel_format : [PixelFormat::parser()] -> PixelFormat]
         //TODO refactor: local parser rfb_string
     [name : [dep(length(u32_be()), utf8())] -> String]
@@ -101,10 +105,16 @@ packet! { SetEncodings:
 
 packet! { FramebufferUpdateRequest:
     [incremental : [u8_bool()] -> bool]
-    [x : [u16_be()] -> u16]
-    [y : [u16_be()] -> u16]
-    [width : [u16_be()] -> u16]
-    [height : [u16_be()] -> u16]
+    [x : [length(u16_be())] -> usize]
+    [y : [length(u16_be())] -> usize]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
+}
+
+packet! { KeyEvent:
+    [down : [u8_bool()] -> bool]
+    [ignored : [ignored(2)] -> ()]
+    [key : [u32_be()] -> u32]
 }
 
 packet! { PointerEvent:
@@ -113,11 +123,22 @@ packet! { PointerEvent:
     [y : [u16_be()] -> u16]
 }
 
+packet! { SetDesktopSize:
+    [ignored : [ignored(1)] -> ()]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
+    [screens : [prefix_len_array(
+        conv(seq(u8p(), ignored(1)), |(n, ())| n, |n| Ok((n, ()))),
+        Screen::parser())] -> Vec<Screen>]
+}
+
 tagged_meta_packet! { ClientToServer: u8p() => u8 =>
     [0] SetPixelFormat,
     [2] SetEncodings,
     [3] FramebufferUpdateRequest,
-    [5] PointerEvent
+    [4] KeyEvent,
+    [5] PointerEvent,
+    [251] SetDesktopSize
 }
 
 packet! { RawRectangle:
@@ -129,6 +150,23 @@ packet! { TightRectangle:
 }
 packet! { DesktopSizeRectangle:
     [ignored : [nothing()] -> ()]
+}
+packet! { CursorRectangle:
+    [ignored : [nothing()] -> ()]
+}
+
+packet! { Screen:
+    [id : [u32_be()] -> u32]
+    [x : [u16_be()] -> u16]
+    [y : [u16_be()] -> u16]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
+    [flags : [u32_be()] -> u32]
+}
+packet! { ExtendedDesktopSizeRectangle:
+    [screens : [prefix_len_array(
+        conv(seq(u8p(), ignored(3)), |(n, ())| n, |n| Ok((n, ()))),
+        Screen::parser())] -> Vec<Screen>]
 }
 //TODO solution to everything: step-by-step parsing(lazy parser)
 //packet! { TrleTile(cpixel_len : usize, width : usize, height : usize):
@@ -148,15 +186,17 @@ packet! { DesktopSizeRectangle:
 tagged_meta_packet! { RectanglePayload: i32_be() => i32 =>
     [ENCODING_RAW] RawRectangle,
     [ENCODING_TIGHT] TightRectangle,
-    [ENCODING_DESKTOP_SIZE] DesktopSizeRectangle
+    [ENCODING_DESKTOP_SIZE] DesktopSizeRectangle,
+    [ENCODING_CURSOR] CursorRectangle,
+    [ENCODING_EXTENDED_DESKTOP_SIZE] ExtendedDesktopSizeRectangle
 }
 
 packet! { Rectangle:
     //[r : [one_way_dep(RectangleHeader::parser, |r| r.width * r.height. RectanglePayload::parser())]
-    [x : [u16_be()] -> u16]
-    [y : [u16_be()] -> u16]
-    [width : [u16_be()] -> u16] //for DesktopSize: x, y ignored; width, height fb width and height
-    [height : [u16_be()] -> u16]
+    [x : [length(u16_be())] -> usize]
+    [y : [length(u16_be())] -> usize]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
     [payload : [RectanglePayload::parser()] -> RectanglePayload]
 }
 
@@ -165,6 +205,17 @@ packet! { FramebufferUpdate:
     [no_of_rectangles : [u16_be()] -> u16]
 }
 
+packet! { Bell:
+    [ignored : [nothing()] -> ()]
+}
+
+packet! { ServerCutText:
+    [ignored : [ignored(3)] -> ()]
+    [string : [dep(length(u32_be()), utf8())] -> String]
+}
+
 tagged_meta_packet! { ServerToClient: u8p() => u8 =>
-    [0] FramebufferUpdate
+    [0] FramebufferUpdate,
+    [2] Bell,
+    [3] ServerCutText
 }

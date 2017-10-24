@@ -92,6 +92,9 @@ impl Parser for U8 {
 pub fn u8p() -> impl Parser<T = u8> {
     U8 { }
 }
+pub fn i8p() -> impl Parser<T = i8> {
+    conv(u8p(), |u| u as i8, |i| Ok(i as u8))
+}
 
 //TODO refactor: write directly in write func
 struct U16Be;
@@ -609,6 +612,7 @@ pub fn length<P, T>(p : P) -> impl Parser<T = usize>
     where P : Parser<T = T>,
           T : Length
 {
+    //TODO error if number too large
     conv(p, |t| t.to_usize(), |size| Ok(T::from_usize(size)))
 }
 

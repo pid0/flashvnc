@@ -5,7 +5,6 @@ authors = ["Patrick Plagwitz <Patrick_Plagwitz@web.de>"]
 
 [dependencies]
 gtk = "*"
-gdk = "*"
 gdk-pixbuf = "*"
 glib = "*"
 # this a dependency of only server_test_program and listed here
@@ -22,6 +21,10 @@ derivative = "*"
 version = "*"
 features = ["png"]
 
+[dependencies.gdk]
+version = "*"
+features = ["v3_20"]
+
 [dev-dependencies]
 libc = "0.2"
 spectral = "0.6.0"
@@ -33,7 +36,12 @@ test = false
 
 [[bin]]
 name = "benchmark"
-path = "tests/benchmark/benchmark.rs"
+path = "tests/bins/benchmark.rs"
+test = false
+
+[[bin]]
+name = "manual_test"
+path = "tests/bins/manual_test.rs"
 test = false
 
 [[bin]]

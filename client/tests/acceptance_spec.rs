@@ -13,23 +13,23 @@ use std::net::{TcpListener,TcpStream,Shutdown};
 use std::io::Write;
 use std::cell::RefCell;
 use std::time::Duration;
-use std::sync::atomic::{AtomicU32,Ordering};
+use std::sync::atomic::{AtomicU16,Ordering};
 use std::thread::JoinHandle;
 use std::sync::mpsc;
 
 use flashvnc::protocol::rfb;
 use flashvnc::protocol::parsing::Packet;
 
-static PORT : AtomicU32 = AtomicU32::new(0);
+static PORT : AtomicU16 = AtomicU16::new(0);
 
-fn new_port() -> u32 {
+fn new_port() -> u16 {
     5910 + PORT.fetch_add(1, Ordering::Relaxed)
 }
-fn server_string(port : u32) -> String {
+fn server_string(port : u16) -> String {
     format!("localhost:{}", port)
 }
 
-fn socketpair(port : u32) -> (TcpStream, TcpStream) {
+fn socketpair(port : u16) -> (TcpStream, TcpStream) {
     let address = server_string(port);
     let address_clone = address.clone();
 
@@ -59,7 +59,7 @@ struct Client {
     socket : TcpStream,
     thread : JoinHandle<Result<(), flashvnc::MainError>>,
     _gui_events : mpsc::Sender<flashvnc::GuiEvent>,
-    _server_port : u32
+    _server_port : u16
 }
 impl Client {
     fn launch() -> Self {
@@ -72,7 +72,8 @@ impl Client {
         let thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             flashvnc::socket_thread_main(flashvnc::ConnectionConfig {
-                host_and_port: server_string(port),
+                host: String::from("localhost"),
+                port: port,
                 benchmark: false
             }, view)
         });
@@ -183,7 +184,8 @@ fn should_stop_and_output_an_error_if_it_cant_write_to_the_server() {
         events_in: rx
     };
     let error_message = flashvnc::handle_connection(flashvnc::ConnectionConfig {
-            host_and_port: String::new(),
+            host: String::new(),
+            port: 0,
             benchmark: false
         }, client, view).unwrap_err().0;
     assert_that!(error_message.to_lowercase()).contains("connection");

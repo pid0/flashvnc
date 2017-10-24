@@ -4,6 +4,7 @@
 
 extern crate gtk;
 extern crate gdk;
+extern crate cairo;
 extern crate glib;
 extern crate gdk_pixbuf;
 #[macro_use]
@@ -12,7 +13,7 @@ extern crate derivative;
 use std::io;
 //use std::io::Read;
 //use std::io::{Read,Write};
-use std::net::TcpStream;
+use std::net::{TcpStream,UdpSocket};
 use std::sync::mpsc;
 
 mod presentation;
@@ -26,6 +27,7 @@ use protocol::parsing::Packet;
 use std::cell::RefCell;
 use std::sync::{Arc,RwLock,RwLockWriteGuard};
 use std::time::{Duration,Instant};
+use std::str::FromStr;
 
 //same as TurboVNC uses
 //TODO use one that is most suitable for this client
@@ -56,20 +58,64 @@ const VIEW_PIXEL_FORMAT : ViewPixelFormat = ViewPixelFormat {
     bytes_per_pixel: 3
 };
 
+//const CURSOR_BYTES_PER_PIXEL : usize = 4;
+
 pub struct ConnectionConfig {
-    pub host_and_port : String,
+    pub host : String,
+    pub port : u16,
     pub benchmark : bool
 }
 
 pub enum GuiEvent {
     Pointer {
         state : u8,
-        mask : u8,
-        //TODO f64 for relative mouse movement?
         x : i32,
         y : i32
     },
-    Foo
+    RelativePointer {
+        state : u8,
+        dx : f64,
+        dy : f64
+    },
+    Keyboard {
+        key : u32,
+        down : bool
+    },
+    Resized(FbSize)
+}
+
+struct CursorDifference {
+    x : f64,
+    y : f64
+}
+impl CursorDifference {
+    fn new() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0
+        }
+    }
+
+    fn remove_integer_parts(&mut self) -> (i32, i32) {
+        let mut x = 0;
+        let mut y = 0;
+
+        if self.x >= 1.0 || self.x <= -1.0 {
+            x = self.x as i32;
+            self.x -= x as f64;
+        }
+        if self.y >= 1.0 || self.y <= -1.0 {
+            y = self.y as i32;
+            self.y -= y as f64;
+        }
+
+        (x, y)
+    }
+
+    fn add(&mut self, x : f64, y : f64) {
+        self.x += x;
+        self.y += y;
+    }
 }
 
 //fn reserve_for(buffer : &SharedBuf, size : usize) {
@@ -84,33 +130,37 @@ pub enum GuiEvent {
 //}
 
 //TODO move to different file
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FbSize {
-    width: u16, 
-    height: u16
+    width: usize, 
+    height: usize
 }
 impl FbSize {
-    pub fn new(width : u16, height : u16) -> Self {
+    pub fn new(width : usize, height : usize) -> Self {
         Self {
             width: width,
             height: height
         }
     }
     pub fn no_of_pixels(&self) -> usize {
-        (self.width as usize) * (self.height as usize)
+        self.width * self.height
     }
 }
-type SharedFbData = Arc<RwLock<Vec<u8>>>;
+type SharedFb = Arc<RwLock<Framebuffer>>;
 pub enum ProtocolEvent {
-    ChangeFbSize(FbSize),
-    UpdateFramebuffer(SharedFbData, FbSize)
+    ChangeDisplaySize(FbSize),
+    UpdateFramebuffer(SharedFb),
+    SetTitle(String)
 }
 pub trait View {
-    fn change_fb_size_to(&self, size : FbSize) {
-        self.handle_event(ProtocolEvent::ChangeFbSize(size));
+    fn change_display_size_to(&self, size : FbSize) {
+        self.handle_event(ProtocolEvent::ChangeDisplaySize(size));
     }
-    fn update_framebuffer(&self, new_fb : SharedFbData, size : FbSize) {
-        self.handle_event(ProtocolEvent::UpdateFramebuffer(new_fb, size));
+    fn update_framebuffer(&self, new_fb : SharedFb) {
+        self.handle_event(ProtocolEvent::UpdateFramebuffer(new_fb));
+    }
+    fn set_title(&self, title : String) {
+        self.handle_event(ProtocolEvent::SetTitle(title));
     }
 
     fn handle_event(&self, event : ProtocolEvent);
@@ -190,12 +240,13 @@ pub fn socket_thread_main<V : View>(
     view : V) -> Result<(), MainError>
 {
     //TODO handle differently (re-connect)?
-    let socket = match TcpStream::connect(&config.host_and_port) {
+    let host_and_port = format!("{}:{}", config.host, config.port);
+    let socket = match TcpStream::connect(&host_and_port) {
         Ok(s) => s,
         Err(err) => {
             //TODO implement From and then Display for MainError
             return Err(MainError(format!("Could not connect to {}: {}", 
-                                         config.host_and_port, err)));
+                                         host_and_port, err)));
         }
     };
 
@@ -211,14 +262,14 @@ pub fn handle_connection<V : View>(
     RfbConnection::new(config, socket, view).handle()
 }
 
-struct Framebuffer {
-    data : SharedFbData,
+pub struct Framebuffer {
+    data : Vec<u8>,
     size : FbSize
 }
 impl Framebuffer {
     fn new() -> Self {
         Self {
-            data: Arc::new(RwLock::new(Vec::new())),
+            data: Vec::new(),
             size: FbSize::new(0, 0)
         }
     }
@@ -230,22 +281,45 @@ impl Framebuffer {
         let new_len = VIEW_PIXEL_FORMAT.bytes_per_pixel 
             * new_size.no_of_pixels();
         let gray = 0xe0u8;
-        self.data.write().unwrap().resize(new_len, gray);
+        self.data.resize(new_len, gray);
     }
 
-    fn size(&self) -> FbSize {
+    pub fn size(&self) -> FbSize {
         self.size
     }
 
-    fn set_pixel(&self, data : &mut RwLockWriteGuard<Vec<u8>>, 
-                 x : usize, y : usize,
+    pub fn data(&self) -> &Vec<u8> {
+        &self.data
+    }
+
+    fn set_pixel(&mut self, x : usize, y : usize,
                  r : u8, g : u8, b : u8) {
         let stride = VIEW_PIXEL_FORMAT.bytes_per_pixel 
             * (self.size.width as usize);
         let pos = y * stride + x * VIEW_PIXEL_FORMAT.bytes_per_pixel;
-        data[pos] = r;
-        data[pos + 1] = g;
-        data[pos + 2] = b;
+        self.data[pos] = r;
+        self.data[pos + 1] = g;
+        self.data[pos + 2] = b;
+    }
+}
+
+fn raw_decode_into(mut dest : RwLockWriteGuard<Framebuffer>, 
+                   src : &[u8], src_size : FbSize,
+                   src_x : usize, src_y : usize) {
+    let mut i = 0;
+    for y in 0..src_size.height {
+        for x in 0..src_size.width {
+            let byte_pos = i * PIXEL_FORMAT_BYTES_PER_PIXEL;
+            let bgra = &src[byte_pos..];
+            dest.set_pixel(
+                x + src_x,
+                y + src_y,
+                bgra[2],
+                bgra[1],
+                bgra[0]
+            );
+            i += 1;
+        }
     }
 }
 
@@ -254,7 +328,7 @@ struct RfbConnection<V : View> {
     socket : TcpStream,
     view : V,
     buffer : SharedBuf,
-    framebuffer : Framebuffer
+    framebuffer : SharedFb
 }
 impl<V : View> RfbConnection<V> {
     fn new(config : ConnectionConfig, socket : TcpStream, view : V) 
@@ -266,7 +340,7 @@ impl<V : View> RfbConnection<V> {
             socket: socket,
             view: view,
             buffer: buffer,
-            framebuffer: Framebuffer::new()
+            framebuffer: Arc::new(RwLock::new(Framebuffer::new()))
         }
     }
 
@@ -283,17 +357,19 @@ impl<V : View> RfbConnection<V> {
     }
 
     fn resize_fb(&mut self, new_size : FbSize) {
-        self.view.change_fb_size_to(new_size);
-        self.framebuffer.resize(new_size);
+        self.view.change_display_size_to(new_size);
+        self.framebuffer.write().unwrap().resize(new_size);
     }
 
     fn fb_size(&self) -> FbSize {
-        self.framebuffer.size()
+        self.framebuffer.read().unwrap().size()
     }
 
-    fn send_fb_update_request(&mut self) -> Result<(), MainError> {
+    fn send_fb_update_request(&mut self, incremental : bool) 
+        -> Result<(), MainError> 
+    {
         let request = rfb::FramebufferUpdateRequest {
-            incremental: false,
+            incremental: incremental,
             x: 0,
             y: 0,
             width: self.fb_size().width,
@@ -350,6 +426,8 @@ impl<V : View> RfbConnection<V> {
         //}’
         self.resize_fb(FbSize::new(server_init.width, server_init.height));
 
+        self.view.set_title(server_init.name.clone());
+
         //TODO ClientToServer/ServerToClient main part of protocol into own function
 
         //TODO keep button mask as state
@@ -359,7 +437,8 @@ impl<V : View> RfbConnection<V> {
             encodings: vec![
                 rfb::ENCODING_RAW,
     //            rfb::ENCODING_TIGHT,
-                rfb::ENCODING_DESKTOP_SIZE]
+                //rfb::ENCODING_CURSOR,
+                rfb::ENCODING_EXTENDED_DESKTOP_SIZE]
         }))?;
 
         self.write_packet(rfb::ClientToServer::SetPixelFormat(
@@ -379,7 +458,15 @@ impl<V : View> RfbConnection<V> {
         //TODO non-blocking select between GUI and server? (use try_recv for mpsc)
         //TODO first: decode everything here, then: use worker threads and *benchmark this*!
 
-        self.send_fb_update_request()?;
+        let mut set_desktop_size_allowed = false;
+        let mut screen_layout : Vec<rfb::Screen> = Vec::new();
+        let mut virtual_cursor_difference = CursorDifference::new();
+        let mut previous_mouse_state = 0;
+        let mouse_server = UdpSocket::bind("0.0.0.0:0")?;
+        mouse_server.connect(
+            (&self.config.host[..], self.config.port - 5900 + 5100))?;
+
+        self.send_fb_update_request(false)?;
         
         let mut in_1_second = Instant::now() + Duration::from_secs(1);
         let mut fps : u32 = 0;
@@ -390,14 +477,51 @@ impl<V : View> RfbConnection<V> {
             stopwatch.take_measurement("start");
             while let Ok(event) = self.view.get_events().try_recv() {
                 match event {
-                    //TODO update button mask as state
-                    GuiEvent::Pointer { state, mask: _, x, y } => {
+                    GuiEvent::Pointer { state, x, y } => {
+//                        eprintln!("button state: {:x}, x: {}, y: {}", state, x, y);
                         self.write_packet(rfb::ClientToServer::PointerEvent(
                                 rfb::PointerEvent {
                                     mask: state,
                                     x: x as u16, //TODO clamp
                                     y: y as u16
                                 }))?;
+                    },
+                    GuiEvent::RelativePointer { state, dx, dy } => {
+                        virtual_cursor_difference.add(dx, dy);
+                        let (int_dx, int_dy) = virtual_cursor_difference.remove_integer_parts();
+                        let state_changed = previous_mouse_state != state;
+                        previous_mouse_state = state;
+                        if int_dx != 0 || int_dy != 0 || state_changed {
+                            let mut message = Vec::new();
+                            protocol::VirtualMouseServerMessage {
+                                button_mask: state,
+                                dx: int_dx as i8,
+                                dy: int_dy as i8
+                            }.write(&mut message).unwrap();
+                            mouse_server.send(&message[..])?;
+                        }
+                    },
+                    GuiEvent::Keyboard { key, down } => {
+                        self.write_packet(rfb::ClientToServer::KeyEvent(
+                                rfb::KeyEvent {
+                                    down: down,
+                                    key: key
+                                }))?;
+                    },
+                    //TODO avoid infinite loop
+                    GuiEvent::Resized(new_size) => {
+//                        if new_size != self.framebuffer.size()
+                          if set_desktop_size_allowed {
+//                            eprintln!("resizing {:?}", new_size);
+                            let screens = screen_layout.clone();
+                            self.write_packet(
+                                rfb::ClientToServer::SetDesktopSize(
+                                    rfb::SetDesktopSize {
+                                        width: new_size.width,
+                                        height: new_size.height,
+                                        screens: screens
+                                    }))?;
+                        }
                     },
                     _ => { }
                 }
@@ -414,7 +538,7 @@ impl<V : View> RfbConnection<V> {
                 before_waiting_for_fb_update);
             match server_packet {
                 rfb::ServerToClient::FramebufferUpdate(update) => {
-                    self.send_fb_update_request()?;
+                    self.send_fb_update_request(false)?;
 //                    eprintln!("received[{}] ‘{:?}’", server_address, update);
                     for _ in 0..update.no_of_rectangles {
                         let rectangle = parse_packet::<rfb::Rectangle>(
@@ -461,29 +585,29 @@ impl<V : View> RfbConnection<V> {
     //                                * (rectangle.height as usize);
     //                            let framebuffer = Vec::with_capacity(framebuffer_size);
                                 
-                                //TODO convert in parser?
-                                let rect_x = rectangle.x as usize;
-                                let rect_y = rectangle.y as usize;
-                                let width = rectangle.width as usize;
-                                let height = rectangle.height as usize;
-
-                                let mut fb_data = self.framebuffer.data.write().unwrap();
-                                let mut i = 0;
-                                for y in 0..height {
-                                    for x in 0..width {
-                                        let byte_pos = i * PIXEL_FORMAT_BYTES_PER_PIXEL;
-                                        let bgra = &bytes[byte_pos..];
-                                        self.framebuffer.set_pixel(
-                                            &mut fb_data,
-                                            x + rect_x,
-                                            y + rect_y,
-                                            bgra[2],
-                                            bgra[1],
-                                            bgra[0]
-                                        );
-                                        i += 1;
-                                    }
-                                }
+                                raw_decode_into(
+                                    self.framebuffer.write().unwrap(),
+                                    &bytes[..],
+                                    FbSize::new(rectangle.width, rectangle.height),
+                                    rectangle.x,
+                                    rectangle.y);
+//                                let mut fb_data = self.framebuffer.data.write().unwrap();
+//                                let mut i = 0;
+//                                for y in 0..height {
+//                                    for x in 0..width {
+//                                        let byte_pos = i * PIXEL_FORMAT_BYTES_PER_PIXEL;
+//                                        let bgra = &bytes[byte_pos..];
+//                                        self.framebuffer.set_pixel(
+//                                            &mut fb_data,
+//                                            x + rect_x,
+//                                            y + rect_y,
+//                                            bgra[2],
+//                                            bgra[1],
+//                                            bgra[0]
+//                                        );
+//                                        i += 1;
+//                                    }
+//                                }
 
     //                            eprintln!("[{}] raw rect: {:?}", server_address,
     //                                      &bytes[0..10]);
@@ -494,10 +618,42 @@ impl<V : View> RfbConnection<V> {
     //                            eprintln!("received[{}] tight: ‘{:?}’", server_address, byte);
                                 unimplemented!()
                             },
+                            rfb::RectanglePayload::CursorRectangle(_) => {
+                                //TODO parse rectangle.size
+//                                let cursor_size = FbSize::new(rectangle.width, 
+//                                                              rectangle.height);
+//                                let mut cursor = Framebuffer::new();
+//                                cursor.resize(cursor_size);
+//
+//                                let no_of_pixel_bytes = cursor_size.no_of_pixels()
+//                                    * PIXEL_FORMAT_BYTES_PER_PIXEL;
+//                                let src_pixels = Vec::with_capacity(no_of_pixel_bytes);
+//                                unsafe {
+//                                    src_pixels.set_len(no_of_pixels);
+//                                }
+//                                ::std::io::Read::read_exact(&mut self.socket, &mut src_pixels[..])?;
+//
+//                                let pixels = Vec::with_capacity(
+//                                    cursor_size.no_of_pixels() * CURSOR_BYTES_PER_PIXEL);
+//
+
+//                                unimplemented!()
+                            },
                             rfb::RectanglePayload::DesktopSizeRectangle(_) => {
                                 eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
                                 self.resize_fb(FbSize::new(
                                         rectangle.width, rectangle.height));
+                            },
+                            rfb::RectanglePayload::ExtendedDesktopSizeRectangle(rect) => {
+//                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
+                                set_desktop_size_allowed = true;
+                                if rectangle.y == rfb::EXTENDED_DESKTOP_NO_ERROR {
+                                    screen_layout = rect.screens;
+                                    self.resize_fb(FbSize::new(rectangle.width, rectangle.height));
+                                }
+                            },
+                            _ => {
+                                unimplemented!()
                             }
                         }
                     }
@@ -519,9 +675,8 @@ impl<V : View> RfbConnection<V> {
                     }
 
                     stopwatch.take_measurement("updating framebuffer");
-                    let fb_data_reference = &self.framebuffer.data;
-                    self.view.update_framebuffer(fb_data_reference.clone(), 
-                                                 self.fb_size());
+                    let fb_reference = &self.framebuffer;
+                    self.view.update_framebuffer(fb_reference.clone());
                     stopwatch.take_measurement("updated framebuffer");
                 }, //frambuffer update (TODO move to func)
                 _ => { }
@@ -567,8 +722,11 @@ impl<V : View> RfbConnection<V> {
 
 pub fn run(args : Vec<String>) {
     //TODO pass &str
+    //TODO handle parse errors
+    let host_and_port : Vec<&str> = args[1].split(":").collect();
     let config = ConnectionConfig {
-        host_and_port: args[1].clone(),
+        host: String::from(host_and_port[0]),
+        port: u16::from_str(host_and_port[1]).unwrap(),
         benchmark: args[args.len() - 1] == "--benchmark"
     };
 

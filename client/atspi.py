@@ -19,7 +19,12 @@ def query_return_code(boolean):
 def eprint(*args):
   print(*args, file=sys.stderr)
 
-def generate_mouse_event(x, y, kind):
+def move_mouse(relative, x, y):
+  action = "mousemove_relative" if relative else "mousemove"
+  return subprocess.run(["xdotool", 
+    action, "--", str(x), str(y)]).returncode == 0
+
+def generate_mouse_event(kind):
   #return Atspi.generate_mouse_event(x, y, kind)
   action = {
       "c": "click",
@@ -28,9 +33,14 @@ def generate_mouse_event(x, y, kind):
   }[kind[2]]
   button = kind[1]
 
-  if subprocess.run(["xdotool", "mousemove", str(x), str(y)]).returncode != 0:
-    return False
   return subprocess.run(["xdotool", action, button]).returncode == 0
+
+def generate_keyboard_event(action, key):
+  xdotool_action = {
+      "key": "key",
+      "key-down": "keydown",
+      "key-up": "keyup"}[action]
+  return subprocess.run(["xdotool", xdotool_action, hex(key)]).returncode == 0
 
 def visit(obj, func):
   func(obj)
@@ -112,15 +122,20 @@ def main(argv):
   screen_extents = drawing_area.get_extents(Atspi.CoordType.SCREEN)
   window_extents = drawing_area.get_extents(Atspi.CoordType.WINDOW)
 
-  #TODO does not work
-  client.grab_focus()
+  #needs can_focus on target widget
   drawing_area.grab_focus()
 
   if command == "mouse":
-    return generate_mouse_event(
-        screen_extents.x + int(command_args[1]),
-        screen_extents.y + int(command_args[2]),
-        command_args[0])
+    if command_args[0] == "m":
+      relative = command_args[1] == "rel"
+      x = int(command_args[2])
+      y = int(command_args[3])
+      if not relative:
+        x += screen_extents.x
+        y += screen_extents.y
+      return move_mouse(relative, x, y)
+    else:
+      return generate_mouse_event(command_args[0])
   elif command == "query-screen-size":
     eprint(window_extents.width, window_extents.height)
     return query_return_code(
@@ -133,6 +148,17 @@ def main(argv):
         screen_extents.x, screen_extents.y,
         screen_extents.width, screen_extents.height)
     pixbuf.savev(dest, "png", [], [])
+  elif command == "focus":
+    time.sleep(0.5)
+    drawing_area.grab_focus()
+    time.sleep(0.5)
+  elif command.startswith("key"):
+    return generate_keyboard_event(command, int(command_args[0]))
+  elif command == "resize":
+    width, height = (s for s in command_args[:2])
+    if subprocess.run(["xdotool", "getactivewindow",
+      "windowsize", "--sync", width, height]).returncode != 0:
+      return False
   else:
     eprint("no such command")
     return 2
