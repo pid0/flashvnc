@@ -44,11 +44,11 @@ fn socketpair(port : u16) -> (TcpStream, TcpStream) {
 }
 
 struct View {
-    events_in : mpsc::Receiver<flashvnc::GuiEvent>
+    events_in : Option<mpsc::Receiver<flashvnc::GuiEvent>>
 }
 impl flashvnc::View for View {
-    fn get_events(&self) -> &mpsc::Receiver<flashvnc::GuiEvent> {
-        &self.events_in
+    fn get_events(&mut self) -> mpsc::Receiver<flashvnc::GuiEvent> {
+        self.events_in.take().unwrap()
     }
     fn handle_event(&self, _event : flashvnc::ProtocolEvent) {
         unimplemented!()
@@ -67,7 +67,7 @@ impl Client {
 
         let (gui_events, gui_events_receiver) = mpsc::channel();
         let view = View {
-            events_in: gui_events_receiver
+            events_in: Some(gui_events_receiver)
         };
         let thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
@@ -181,7 +181,7 @@ fn should_stop_and_output_an_error_if_it_cant_write_to_the_server() {
     //TODO refactor
     let (_, rx) = mpsc::channel();
     let view = View {
-        events_in: rx
+        events_in: Some(rx)
     };
     let error_message = flashvnc::handle_connection(flashvnc::ConnectionConfig {
             host: String::new(),

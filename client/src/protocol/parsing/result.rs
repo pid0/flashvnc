@@ -26,7 +26,8 @@ pub type ParseEndResult<T> = Result<T, (ParseError, BytePosition)>;
 #[derive(Debug)]
 pub enum WriteError {
     IoError(io::Error),
-    ConversionFailed(&'static str)
+    ConversionFailed(&'static str),
+    PredicateFailed(&'static str)
 }
 impl WriteError {
     pub fn is_io_error(&self) -> bool {

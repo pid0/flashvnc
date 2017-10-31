@@ -1,6 +1,10 @@
 #![feature(conservative_impl_trait)]
 #![feature(const_fn)]
 #![feature(drop_types_in_const)]
+#![feature(test)]
+
+#[cfg(test)]
+extern crate test;
 
 extern crate gtk;
 extern crate gdk;
@@ -9,9 +13,12 @@ extern crate glib;
 extern crate gdk_pixbuf;
 #[macro_use]
 extern crate derivative;
+extern crate flate2;
+extern crate libc;
 
 use std::io;
-//use std::io::Read;
+use std::io::{BufReader,BufWriter,Read,Write};
+use std::ptr;
 //use std::io::{Read,Write};
 use std::net::{TcpStream,UdpSocket};
 use std::sync::mpsc;
@@ -20,12 +27,15 @@ mod presentation;
 use presentation::gtk as gtk_frontend;
 
 pub mod protocol;
+mod encoding;
+use encoding::{DecodingJob,DecodingMaster,EncodingMethod,TightData};
+mod tight;
 
 use protocol::rfb;
 use protocol::parsing::io_input::SharedBuf;
 use protocol::parsing::Packet;
 use std::cell::RefCell;
-use std::sync::{Arc,RwLock,RwLockWriteGuard};
+use std::sync::{Arc,RwLock};
 use std::time::{Duration,Instant};
 use std::str::FromStr;
 
@@ -48,6 +58,7 @@ const PIXEL_FORMAT : rfb::PixelFormat = rfb::PixelFormat {
 };
 const PIXEL_FORMAT_BYTES_PER_PIXEL : usize = 
     (PIXEL_FORMAT.bits_per_pixel as usize) / 8;
+const TPIXEL_SIZE : usize = 3;
 //[0, 0, 255, 0, 0, 0, 255, 0, 0, 0]
 //-> 0x00ff0000 -> red: 0x00ff & 0xff
 
@@ -66,6 +77,54 @@ pub struct ConnectionConfig {
     pub benchmark : bool
 }
 
+pub enum EncodingQuality {
+    LossyHigh,
+    LossyMedium,
+    LossyMediumInterframeComparison,
+    LossyLow,
+    Lossless
+}
+impl EncodingQuality {
+    fn get_rfb_encodings(&self) -> Vec<i32> {
+        use EncodingQuality::*;
+        match *self {
+            LossyHigh => vec![
+                rfb::ENCODING_WORST_JPEG_QUALITY + 95,
+                rfb::ENCODING_CHROMA_SUBSAMPLING_1X,
+                rfb::ENCODING_COMPRESSION_LEVEL_0 + 1],
+            LossyMedium => vec![
+                rfb::ENCODING_WORST_JPEG_QUALITY + 80,
+                rfb::ENCODING_CHROMA_SUBSAMPLING_2X,
+                rfb::ENCODING_COMPRESSION_LEVEL_0 + 1],
+            LossyMediumInterframeComparison => vec![
+                rfb::ENCODING_WORST_JPEG_QUALITY + 80,
+                rfb::ENCODING_CHROMA_SUBSAMPLING_2X,
+                rfb::ENCODING_COMPRESSION_LEVEL_0 + 1 + 5],
+            LossyLow => vec![
+                rfb::ENCODING_WORST_JPEG_QUALITY + 30,
+                rfb::ENCODING_CHROMA_SUBSAMPLING_4X,
+                rfb::ENCODING_COMPRESSION_LEVEL_0 + 2 + 5],
+            Lossless => vec![rfb::ENCODING_COMPRESSION_LEVEL_0 + 1 + 5]
+        }
+    }
+}
+fn get_rfb_encodings(encoding_quality : EncodingQuality) -> Vec<i32> {
+    let mut encodings = vec![
+            rfb::ENCODING_TIGHT,
+            rfb::ENCODING_RAW,
+            
+            //rfb::ENCODING_CURSOR,
+            rfb::ENCODING_EXTENDED_DESKTOP_SIZE,
+
+            rfb::ENCODING_LAST_RECT,
+            rfb::ENCODING_CONTINUOUS_UPDATES,
+            rfb::ENCODING_FENCE
+    ];
+    encodings.append(&mut encoding_quality.get_rfb_encodings());
+    encodings
+}
+
+
 pub enum GuiEvent {
     Pointer {
         state : u8,
@@ -81,6 +140,7 @@ pub enum GuiEvent {
         key : u32,
         down : bool
     },
+    SetEncodingQuality(EncodingQuality),
     Resized(FbSize)
 }
 
@@ -164,7 +224,7 @@ pub trait View {
     }
 
     fn handle_event(&self, event : ProtocolEvent);
-    fn get_events(&self) -> &mpsc::Receiver<GuiEvent>;
+    fn get_events(&mut self) -> mpsc::Receiver<GuiEvent>;
 }
 
 fn in_seconds(duration : Duration) -> f64 {
@@ -183,7 +243,7 @@ impl Stopwatch {
     pub fn take_measurement(&mut self, title : &str) {
         let now = Instant::now();
         eprintln!("stopwatch: ‘{}’ {:?} ({:?})", title, now, 
-                  now.duration_since(self.most_recent_instant));
+                  in_seconds(now.duration_since(self.most_recent_instant)));
         self.most_recent_instant = now;
     }
 }
@@ -202,9 +262,10 @@ impl From<io::Error> for MainError {
     }
 }
 
-fn parse_packet<T>(buffer : &SharedBuf, input : &TcpStream) 
+fn parse_packet<T, I>(buffer : &SharedBuf, input : I) 
     -> Result<T, MainError>
-    where T : Packet
+    where T : Packet,
+          I : io::Read
 {
     let ret = T::parse(buffer, input);
     match ret {
@@ -219,9 +280,10 @@ fn parse_packet<T>(buffer : &SharedBuf, input : &TcpStream)
     }
 }
 
-fn write_packet<T>(packet : T, output : &mut TcpStream)
+fn write_packet<T, O>(packet : T, output : O)
     -> Result<(), MainError>
-    where T : Packet
+    where T : Packet,
+          O : io::Write
 {
     match packet.write(output) {
         Ok(()) => Ok(()),
@@ -262,6 +324,22 @@ pub fn handle_connection<V : View>(
     RfbConnection::new(config, socket, view).handle()
 }
 
+#[repr(C)]
+pub struct Rgb {
+    pub r : u8,
+    pub g : u8,
+    pub b : u8
+}
+impl Rgb {
+    pub fn from_tpixel(tpixel : rfb::TPixel) -> Self {
+        Self {
+            r: tpixel.r,
+            g: tpixel.g,
+            b: tpixel.b,
+        }
+    }
+}
+
 pub struct Framebuffer {
     data : Vec<u8>,
     size : FbSize
@@ -292,43 +370,203 @@ impl Framebuffer {
         &self.data
     }
 
+    fn stride(&self) -> usize {
+        VIEW_PIXEL_FORMAT.bytes_per_pixel * self.size.width
+    }
+    fn byte_pos(&self, x : usize, y : usize) -> usize {
+        y * self.stride() + x * VIEW_PIXEL_FORMAT.bytes_per_pixel
+    }
+
     fn set_pixel(&mut self, x : usize, y : usize,
                  r : u8, g : u8, b : u8) {
-        let stride = VIEW_PIXEL_FORMAT.bytes_per_pixel 
-            * (self.size.width as usize);
-        let pos = y * stride + x * VIEW_PIXEL_FORMAT.bytes_per_pixel;
+        let pos = self.byte_pos(x, y);
         self.data[pos] = r;
         self.data[pos + 1] = g;
         self.data[pos + 2] = b;
     }
+
+    fn set_line(&mut self, x : usize, width : usize, y : usize, line : &[Rgb]) {
+        assert!(x + width <= self.size.width);
+        assert!(y <= self.size.height);
+        let pos = self.byte_pos(x, y);
+        unsafe {
+            let data = self.data.as_mut_ptr().offset(pos as isize) as *mut Rgb;
+            ptr::copy_nonoverlapping(line.as_ptr(), data, width);
+        }
+    }
 }
 
-fn raw_decode_into(mut dest : RwLockWriteGuard<Framebuffer>, 
-                   src : &[u8], src_size : FbSize,
-                   src_x : usize, src_y : usize) {
-    let mut i = 0;
-    for y in 0..src_size.height {
-        for x in 0..src_size.width {
-            let byte_pos = i * PIXEL_FORMAT_BYTES_PER_PIXEL;
-            let bgra = &src[byte_pos..];
-            dest.set_pixel(
-                x + src_x,
-                y + src_y,
-                bgra[2],
-                bgra[1],
-                bgra[0]
-            );
-            i += 1;
+enum RfbWriteEvent {
+    GuiEvent(GuiEvent),
+    SetScreenLayout(Vec<rfb::Screen>),
+    AllowSetDesktopSize,
+    UpdateRequest { 
+        incremental : bool,
+        size : FbSize
+    },
+    EnableContinuousUpdates {
+        on : bool,
+        x : usize,
+        y : usize,
+        size : FbSize
+    },
+    Fence {
+        flags : u32,
+        payload : Vec<u8>
+    },
+    Heartbeat
+}
+struct RfbWriteEnd {
+    socket : BufWriter<TcpStream>,
+    input : mpsc::Receiver<RfbWriteEvent>,
+    mouse_server : UdpSocket
+}
+impl RfbWriteEnd {
+    fn write_packet<T>(&mut self, packet : T) -> Result<(), MainError>
+        where T : Packet
+    {
+        write_packet(packet, &mut self.socket)
+    }
+
+    fn handle(&mut self) -> Result<(), MainError> {
+        use GuiEvent as Gui;
+        use RfbWriteEvent::*;
+
+        let mut virtual_cursor_difference = CursorDifference::new();
+        let mut previous_mouse_state = 0;
+        let mut screen_layout : Vec<rfb::Screen> = Vec::new();
+        let mut set_desktop_size_allowed = false;
+
+        while let Ok(event) = self.input.recv() {
+            match event {
+                GuiEvent(Gui::Pointer { state, x, y }) => {
+//                        eprintln!("button state: {:x}, x: {}, y: {}", state, x, y);
+                    self.write_packet(rfb::ClientToServer::PointerEvent(
+                            rfb::PointerEvent {
+                                mask: state,
+                                x: x as u16, //TODO clamp
+                                y: y as u16
+                            }))?;
+                },
+                GuiEvent(Gui::RelativePointer { state, dx, dy }) => {
+                    virtual_cursor_difference.add(dx, dy);
+                    let (int_dx, int_dy) = virtual_cursor_difference.remove_integer_parts();
+                    let state_changed = previous_mouse_state != state;
+                    previous_mouse_state = state;
+                    if int_dx != 0 || int_dy != 0 || state_changed {
+                        let mut message = Vec::new();
+                        //eprintln!("{:?} sending relative mouse message", Instant::now());
+                        protocol::VirtualMouseServerMessage {
+                            button_mask: state,
+                            dx: int_dx as i8,
+                            dy: int_dy as i8
+                        }.write(&mut message).unwrap();
+                        self.mouse_server.send(&message[..])?;
+                    }
+                },
+                GuiEvent(Gui::Keyboard { key, down }) => {
+                    self.write_packet(rfb::ClientToServer::KeyEvent(
+                            rfb::KeyEvent {
+                                down: down,
+                                key: key
+                            }))?;
+                },
+                GuiEvent(Gui::Resized(new_size)) => {
+//                        if new_size != self.framebuffer.size()
+                    if set_desktop_size_allowed {
+                        let screens = screen_layout.clone();
+                        self.write_packet(
+                            rfb::ClientToServer::SetDesktopSize(
+                                rfb::SetDesktopSize {
+                                    width: new_size.width,
+                                    height: new_size.height,
+                                    screens: screens
+                                }))?;
+                    }
+                },
+                GuiEvent(Gui::SetEncodingQuality(new_quality)) => {
+                    self.send_set_encodings(new_quality)?;
+                },
+                SetScreenLayout(layout) => {
+                    screen_layout = layout
+                },
+                AllowSetDesktopSize => {
+                    set_desktop_size_allowed = true;
+                },
+                UpdateRequest { incremental, size } => {
+                    let request = rfb::FramebufferUpdateRequest {
+                        incremental: incremental,
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height
+                    };
+                    self.write_packet(rfb::ClientToServer
+                                      ::FramebufferUpdateRequest(request))?;
+                },
+                EnableContinuousUpdates { on, x, y, size } => {
+                    let message = rfb::EnableContinuousUpdates {
+                        enable: on,
+                        x: x,
+                        y: y,
+                        width: size.width,
+                        height: size.height
+                    };
+                    self.write_packet(rfb::ClientToServer
+                                      ::EnableContinuousUpdates(message))?;
+
+                },
+                Fence { flags, payload } => {
+                    let message = rfb::Fence {
+                        flags: flags,
+                        payload: payload
+                    };
+                    self.write_packet(rfb::ClientToServer
+                                      ::Fence(message))?;
+                },
+                Heartbeat => { }
+            }
+            self.socket.flush()?;
         }
+        Ok(())
+    }
+
+    fn send_set_encodings(&mut self, encoding_quality : EncodingQuality)
+        ->  Result<(), MainError>
+    {
+        self.write_packet(rfb::ClientToServer::SetEncodings(rfb::SetEncodings {
+            encodings: get_rfb_encodings(encoding_quality)
+        }))
+    }
+
+}
+
+fn disable_nagles_algo(socket : &TcpStream) -> io::Result<()> {
+    use std::os::unix::io::IntoRawFd;
+
+    let one : libc::c_int = 1;
+    let socket_fd = socket.try_clone().unwrap().into_raw_fd();
+    let ret;
+    unsafe {
+        ret = libc::setsockopt(
+            socket_fd, libc::SOL_TCP, libc::TCP_NODELAY, 
+            &one as *const libc::c_int as *const libc::c_void, 
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+    if ret != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
 struct RfbConnection<V : View> {
     config : ConnectionConfig,
-    socket : TcpStream,
+    socket : BufReader<TcpStream>,
     view : V,
     buffer : SharedBuf,
-    framebuffer : SharedFb
+    framebuffer : SharedFb,
+    write_end_sender : Option<mpsc::Sender<RfbWriteEvent>>
 }
 impl<V : View> RfbConnection<V> {
     fn new(config : ConnectionConfig, socket : TcpStream, view : V) 
@@ -337,50 +575,99 @@ impl<V : View> RfbConnection<V> {
         let buffer = RefCell::new(Vec::new());
         Self {
             config: config,
-            socket: socket,
+            socket: BufReader::new(socket),
             view: view,
             buffer: buffer,
-            framebuffer: Arc::new(RwLock::new(Framebuffer::new()))
+            framebuffer: Arc::new(RwLock::new(Framebuffer::new())),
+            write_end_sender: None
         }
     }
 
-    fn parse_packet<T>(&self) -> Result<T, MainError>
+    fn parse_packet<T>(&mut self) -> Result<T, MainError>
         where T : Packet
     {
-        parse_packet::<T>(&self.buffer, &self.socket)
+        parse_packet(&self.buffer, &mut self.socket)
     }
-
     fn write_packet<T>(&mut self, packet : T) -> Result<(), MainError>
         where T : Packet
     {
-        write_packet(packet, &mut self.socket)
+        write_packet(packet, self.socket.get_mut())
+    }
+
+    fn read_bytes(&mut self, length : usize) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(length);
+        unsafe {
+            bytes.set_len(length);
+        }
+        self.socket.read_exact(&mut bytes[..])?;
+        Ok(bytes)
+    }
+    fn read_zlib_data(&mut self, stream_no : usize, uncompressed_size : usize)
+        -> Result<TightData, MainError>
+    {
+        Ok(if uncompressed_size < 12 {
+            TightData::UncompressedRgb(self.read_bytes(uncompressed_size)?)
+        } else {
+            let size = self.parse_packet::<rfb::TightZlib>()?.length;
+            TightData::CompressedRgb {
+                stream_no: stream_no,
+                bytes: self.read_bytes(size)?
+            }
+        })
     }
 
     fn resize_fb(&mut self, new_size : FbSize) {
         self.view.change_display_size_to(new_size);
         self.framebuffer.write().unwrap().resize(new_size);
+        self.write_end().send(RfbWriteEvent::EnableContinuousUpdates {
+            on: true,
+            x: 0,
+            y: 0,
+            size: new_size
+        }).unwrap_or(());
     }
 
     fn fb_size(&self) -> FbSize {
         self.framebuffer.read().unwrap().size()
     }
 
-    fn send_fb_update_request(&mut self, incremental : bool) 
-        -> Result<(), MainError> 
-    {
-        let request = rfb::FramebufferUpdateRequest {
+    fn write_end(&self) -> &mpsc::Sender<RfbWriteEvent> {
+        self.write_end_sender.as_ref().unwrap()
+    }
+    fn send_fb_update_request(&mut self, incremental : bool) {
+        self.write_end().send(RfbWriteEvent::UpdateRequest {
             incremental: incremental,
-            x: 0,
-            y: 0,
-            width: self.fb_size().width,
-            height: self.fb_size().height
-        };
-        self.write_packet(rfb::ClientToServer::FramebufferUpdateRequest(
-                request))
+            size: self.fb_size()
+        }).unwrap_or(());
     }
 
     fn handle(&mut self) -> Result<(), MainError>  {
-        let server_address = self.socket.peer_addr().unwrap();
+        let server_init = self.setup()?;
+        
+        self.view.set_title(server_init.name.clone());
+        self.write_packet(rfb::ClientToServer::SetEncodings(rfb::SetEncodings {
+            encodings: get_rfb_encodings(EncodingQuality::LossyHigh)
+        }))?;
+        self.write_packet(rfb::ClientToServer::SetPixelFormat(
+                rfb::SetPixelFormat {
+                    format: PIXEL_FORMAT.clone()
+                }
+        ))?;
+
+        disable_nagles_algo(self.socket.get_ref())?;
+
+        self.handle_main_part(server_init)
+        //TODO call exit on view instead
+    //    glib::idle_add(|| {
+    //        gtk::main_quit();
+    //        glib::Continue(false)
+    //    });
+
+    //    Ok(())
+    }
+
+    fn setup(&mut self) -> Result<rfb::ServerInit, MainError> {
+        let _server_address = self.socket.get_ref().peer_addr().unwrap();
 
         let protocol_version = self.parse_packet::<rfb::ProtocolVersion>()?;
         self.write_packet(protocol_version)?;
@@ -410,216 +697,273 @@ impl<V : View> RfbConnection<V> {
         }
 
         self.write_packet(rfb::ClientInit {
-            shared: false
+            shared: true
         })?;
 
-        let server_init = self.parse_packet::<rfb::ServerInit>()?;
-    //    eprintln!("received[{}] ‘{:?}’", server_address, server_init);
-        //‘ServerInit { 
-        //width: 1240, height: 900, 
-        //pixel_format: PixelFormat { 
-        //bits_per_pixel: 32,
-        //depth: 24, big_endian: false, true_color: true, 
-        //red_max: 255, green_max: 255, blue_max: 255,
-        //red_shift: 16, green_shift: 8, blue_shift: 0 }, 
-        //name: "TurboVNC: PatrickDesktop:2 (patrick)"
-        //}’
-        self.resize_fb(FbSize::new(server_init.width, server_init.height));
+        self.parse_packet::<rfb::ServerInit>()
+    }
 
-        self.view.set_title(server_init.name.clone());
-
-        //TODO ClientToServer/ServerToClient main part of protocol into own function
-
-        //TODO keep button mask as state
-        //note: TurboVNC then uses a protocol writer with a mutex
-        
-        self.write_packet(rfb::ClientToServer::SetEncodings(rfb::SetEncodings {
-            encodings: vec![
-                rfb::ENCODING_RAW,
-    //            rfb::ENCODING_TIGHT,
-                //rfb::ENCODING_CURSOR,
-                rfb::ENCODING_EXTENDED_DESKTOP_SIZE]
-        }))?;
-
-        self.write_packet(rfb::ClientToServer::SetPixelFormat(
-                rfb::SetPixelFormat {
-                    format: PIXEL_FORMAT.clone()
-                }
-        ))?;
-
-        //handle_rfb_main_part(
-        
-    //    write_packet(rfb::ClientToServer::PointerEvent(rfb::PointerEvent {
-    //        mask: 1, //button 1 (button 3 == 4)
-    //        x: 5,
-    //        y: 7
-    //    }), &mut self.socket)?;
-
+    fn handle_main_part(&mut self, server_init : rfb::ServerInit)
+        -> Result<(), MainError>
+    {
         //TODO non-blocking select between GUI and server? (use try_recv for mpsc)
         //TODO first: decode everything here, then: use worker threads and *benchmark this*!
+        
+        let mut decoder = DecodingMaster::new(self.framebuffer.clone());
 
-        let mut set_desktop_size_allowed = false;
-        let mut screen_layout : Vec<rfb::Screen> = Vec::new();
-        let mut virtual_cursor_difference = CursorDifference::new();
-        let mut previous_mouse_state = 0;
+        let mut jpeg_duration = Duration::from_secs(0);
+        let mut jpeg_times = 0;
+
+        let (write_end_sender, write_end_receiver) = mpsc::channel();
+        let write_end_sender_clone = write_end_sender.clone();
+        let write_end_sender_clone_2 = write_end_sender.clone();
+        self.write_end_sender = Some(write_end_sender);
+        self.resize_fb(FbSize::new(server_init.width, server_init.height));
+
         let mouse_server = UdpSocket::bind("0.0.0.0:0")?;
         mouse_server.connect(
             (&self.config.host[..], self.config.port - 5900 + 5100))?;
+        let write_end_socket = self.socket.get_ref().try_clone().unwrap();
+        let write_end = std::thread::spawn(move || {
+            RfbWriteEnd {
+                socket: BufWriter::new(write_end_socket),
+                input: write_end_receiver,
+                mouse_server: mouse_server
+            }.handle()
+        });
+        let gui_events = self.view.get_events();
+        std::thread::spawn(move || {
+            while let Ok(event) = gui_events.recv() {
+                write_end_sender_clone.send(RfbWriteEvent::GuiEvent(event))
+                    .unwrap_or(());
+            }
+        });
+        //causes the server to respond more often
+//        std::thread::spawn(move || {
+//            loop {
+//                std::thread::sleep(Duration::from_millis(2));
+//                write_end_sender_clone_2.send(RfbWriteEvent::GuiEvent(
+//                        GuiEvent::Keyboard {
+//                            key: 0x20,
+//                            down: false
+//                        })).unwrap_or(());
+//            }
+//        });
 
-        self.send_fb_update_request(false)?;
-        
+        self.send_fb_update_request(false);
+//        self.write_end().send(RfbWriteEvent::Fence {
+//            flags: rfb::FENCE_REQUEST | rfb::FENCE_SYNC_NEXT,
+//            payload: Vec::new()
+//        }).unwrap_or(());
+        let start = Instant::now();
+
         let mut in_1_second = Instant::now() + Duration::from_secs(1);
-        let mut fps : u32 = 0;
+        let mut fps : f64 = 0.0;
         let mut time_spent_waiting = Duration::from_secs(0);
 //        let mut stopwatch = Stopwatch::new();
         let mut stopwatch = NullStopwatch::new();
         loop {
             stopwatch.take_measurement("start");
-            while let Ok(event) = self.view.get_events().try_recv() {
-                match event {
-                    GuiEvent::Pointer { state, x, y } => {
-//                        eprintln!("button state: {:x}, x: {}, y: {}", state, x, y);
-                        self.write_packet(rfb::ClientToServer::PointerEvent(
-                                rfb::PointerEvent {
-                                    mask: state,
-                                    x: x as u16, //TODO clamp
-                                    y: y as u16
-                                }))?;
-                    },
-                    GuiEvent::RelativePointer { state, dx, dy } => {
-                        virtual_cursor_difference.add(dx, dy);
-                        let (int_dx, int_dy) = virtual_cursor_difference.remove_integer_parts();
-                        let state_changed = previous_mouse_state != state;
-                        previous_mouse_state = state;
-                        if int_dx != 0 || int_dy != 0 || state_changed {
-                            let mut message = Vec::new();
-                            protocol::VirtualMouseServerMessage {
-                                button_mask: state,
-                                dx: int_dx as i8,
-                                dy: int_dy as i8
-                            }.write(&mut message).unwrap();
-                            mouse_server.send(&message[..])?;
-                        }
-                    },
-                    GuiEvent::Keyboard { key, down } => {
-                        self.write_packet(rfb::ClientToServer::KeyEvent(
-                                rfb::KeyEvent {
-                                    down: down,
-                                    key: key
-                                }))?;
-                    },
-                    //TODO avoid infinite loop
-                    GuiEvent::Resized(new_size) => {
-//                        if new_size != self.framebuffer.size()
-                          if set_desktop_size_allowed {
-//                            eprintln!("resizing {:?}", new_size);
-                            let screens = screen_layout.clone();
-                            self.write_packet(
-                                rfb::ClientToServer::SetDesktopSize(
-                                    rfb::SetDesktopSize {
-                                        width: new_size.width,
-                                        height: new_size.height,
-                                        screens: screens
-                                    }))?;
-                        }
-                    },
-                    _ => { }
-                }
+            if let Err(_) = self.write_end().send(RfbWriteEvent::Heartbeat) {
+                return Err(write_end.join().unwrap().unwrap_err());
             }
-
-            stopwatch.take_measurement("before request");
             //TODO do not block when waiting for the FramebufferUpdate
 
             stopwatch.take_measurement("waiting for update");
-            let _raw_rect_size = 5;
             let before_waiting_for_fb_update = Instant::now();
             let server_packet = self.parse_packet::<rfb::ServerToClient>()?;
             time_spent_waiting += Instant::now().duration_since(
                 before_waiting_for_fb_update);
+//            let message_type = match server_packet {
+//                rfb::ServerToClient::FramebufferUpdate(_) => "update",
+//                rfb::ServerToClient::Fence(_) => "fence",
+//                _ => "other"
+//            };
+//            eprintln!("waited: {} for {} ({})", 
+//                      in_seconds(Instant::now().duration_since(
+//                              before_waiting_for_fb_update)),
+//                      message_type,
+//                      in_seconds(Instant::now().duration_since(start)));
             match server_packet {
                 rfb::ServerToClient::FramebufferUpdate(update) => {
-                    self.send_fb_update_request(false)?;
-//                    eprintln!("received[{}] ‘{:?}’", server_address, update);
-                    for _ in 0..update.no_of_rectangles {
-                        let rectangle = parse_packet::<rfb::Rectangle>(
-                            &self.buffer, &self.socket)?;
-//                        eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                        match rectangle.payload {
-                            //TODO refactor to e.g. rfb::rect::Raw with a pub type
-                            //TODO test should_request_the_full_framebuffer_after_initialization and
-                            //check if handled correctly
-                            //next:
-                            //x. LazyVec -> make compile (minus skip and change_fb_size and errors)
-                            //x. implement change_fb_size
-                            //x. pass walking skeleton
-                            //x. write benchmark, first without any pixel data, just a loop
-                            //5. write test above as end-to-end test, take a screenshot. Write the
-                            //   benchmark while passing this test.
-                            //6. implement skip?, handle errors for manual I/O operations (see TODO above)
-                            //7. implement Tight encoding
-                            //8. implement JPEG encoding (is Tight?)
-                            rfb::RectanglePayload::RawRectangle(_) => {
-                                //TODO implement
-                                //TODO implement a skip function
-                                //TODO handle error
-                                
-                                //TODO re-use buffer
-    //                            assert_eq!(rectangle.width, fb_size.width);
-    //                            assert_eq!(rectangle.height, fb_size.height);
-                                let size = ((PIXEL_FORMAT
-                                            .bits_per_pixel as usize) / 8)
-                                    * (rectangle.width as usize)
-                                    * (rectangle.height as usize);
-                                let size = size as usize;
-                                let mut bytes = Vec::with_capacity(size);
-                                unsafe {
-                                    bytes.set_len(size);
-                                }
-//                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                                let start = Instant::now();
-                                ::std::io::Read::read_exact(&mut self.socket, &mut bytes[..])?;
-                                time_spent_waiting += Instant::now().duration_since(start);
-    //                            let framebuffer_size = 
-    //                                VIEW_PIXEL_FORMAT.bytes_per_pixel
-    //                                * (rectangle.width as usize)
-    //                                * (rectangle.height as usize);
-    //                            let framebuffer = Vec::with_capacity(framebuffer_size);
-                                
-                                raw_decode_into(
-                                    self.framebuffer.write().unwrap(),
-                                    &bytes[..],
-                                    FbSize::new(rectangle.width, rectangle.height),
-                                    rectangle.x,
-                                    rectangle.y);
-//                                let mut fb_data = self.framebuffer.data.write().unwrap();
-//                                let mut i = 0;
-//                                for y in 0..height {
-//                                    for x in 0..width {
-//                                        let byte_pos = i * PIXEL_FORMAT_BYTES_PER_PIXEL;
-//                                        let bgra = &bytes[byte_pos..];
-//                                        self.framebuffer.set_pixel(
-//                                            &mut fb_data,
-//                                            x + rect_x,
-//                                            y + rect_y,
-//                                            bgra[2],
-//                                            bgra[1],
-//                                            bgra[0]
-//                                        );
-//                                        i += 1;
-//                                    }
-//                                }
+                    stopwatch.take_measurement("update");
+                    let mut area = 0.0;
+                    //TODO not required if continuous updates are enabled
+//                    self.send_fb_update_request(true);
 
-    //                            eprintln!("[{}] raw rect: {:?}", server_address,
-    //                                      &bytes[0..10]);
-    //                            unimplemented!()
+//                    eprintln!("received[{}] ‘{:?}’", server_address, update);
+                    let _before_decoding = Instant::now();
+                    for _ in 0..update.no_of_rectangles {
+                        //TODO bounds check
+                        let rectangle = self.parse_packet::<rfb::Rectangle>()?;
+                        area += rectangle.width as f64 
+                            * rectangle.height as f64;
+//                        eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
+                        if self.handle_rectangle(&mut decoder, rectangle,
+                                                 &mut time_spent_waiting,
+                                                 &mut jpeg_duration,
+                                                 &mut jpeg_times)? {
+                            break;
+                        }
+                    }
+//                    eprintln!("decoding took {}", in_seconds(
+//                            Instant::now().duration_since(_before_decoding)));
+
+                    if self.config.benchmark {
+                        let fb_area = self.fb_size().width as f64
+                            * self.fb_size().height as f64;
+                        fps += area / fb_area;
+                        if Instant::now() >= in_1_second {
+                            let fps_without_waiting = 
+                                fps / (1.0 - in_seconds(time_spent_waiting));
+                            let fps_without_waiting = fps_without_waiting.round();
+                            println!("{} {} {}", fps.round(), fps_without_waiting,
+                                     jpeg_times as f64 / in_seconds(jpeg_duration));
+                            ::std::io::Write::flush(
+                                &mut ::std::io::stdout()).unwrap();
+                            fps = 0.0;
+                            time_spent_waiting = Duration::from_secs(0);
+                            in_1_second += Duration::from_secs(1);
+
+                            jpeg_duration = Duration::from_secs(0);
+                            jpeg_times = 0;
+                        }
+                    }
+
+                    stopwatch.take_measurement("updating framebuffer");
+                    let fb_reference = &self.framebuffer;
+                    self.view.update_framebuffer(fb_reference.clone());
+                },
+                rfb::ServerToClient::Fence(fence) => { 
+//                    eprintln!("fence: {:?}", fence);
+                    let mut flags = fence.flags;
+                    if fence.flags & rfb::FENCE_REQUEST != 0 {
+                        flags &= !rfb::FENCE_REQUEST;
+                        flags &= rfb::FENCE_BLOCK_BEFORE 
+                            | rfb::FENCE_BLOCK_AFTER;
+                        self.write_end().send(RfbWriteEvent::Fence {
+                            flags: flags,
+                            payload: fence.payload
+                        }).unwrap_or(());
+                    }
+                },
+                rfb::ServerToClient::EndOfContinuousUpdates(_) => { },
+                rfb::ServerToClient::ServerCutText(_) => { },
+                rfb::ServerToClient::Bell(_) => { }
+            }
+        }
+    }
+
+    fn handle_rectangle(&mut self,
+                        decoder : &mut DecodingMaster,
+                        rectangle : rfb::Rectangle,
+                        time_spent_waiting : &mut Duration,
+                        jpeg_duration : &mut Duration,
+                        jpeg_times : &mut u32)
+        -> Result<bool, MainError>
+    {
+        match rectangle.payload {
+            //TODO refactor to e.g. rfb::rect::Raw with a pub type
+            rfb::RectanglePayload::RawRectangle(_) => {
+                let size = ((PIXEL_FORMAT
+                            .bits_per_pixel as usize) / 8)
+                    * rectangle.width
+                    * rectangle.height;
+            
+                let start = Instant::now();
+                let bytes = self.read_bytes(size)?;
+                *time_spent_waiting += Instant::now().duration_since(start);
+
+                decoder.accept(DecodingJob::rect_from_rfb(
+                        &rectangle,
+                        EncodingMethod::RawBgra(bytes)))?;
+            },
+            rfb::RectanglePayload::TightRectangle(ref payload) => {
+                let zlib_reset_map = payload.control_byte & 0x0f;
+                if zlib_reset_map & 0x01 != 0 {
+                    decoder.accept(DecodingJob::ResetZlib(0))?;
+                }
+                if zlib_reset_map & 0x02 != 0 {
+                    decoder.accept(DecodingJob::ResetZlib(1))?;
+                }
+                if zlib_reset_map & 0x04 != 0 {
+                    decoder.accept(DecodingJob::ResetZlib(2))?;
+                }
+                if zlib_reset_map & 0x08 != 0 {
+                    decoder.accept(DecodingJob::ResetZlib(3))?;
+                }
+                let zlib_stream_no = (payload.control_byte & 0x30) >> 4;
+                let zlib_stream_no = zlib_stream_no as usize;
+
+                match payload.method {
+                    rfb::TightMethod::Fill(_) => {
+                        let color = self.parse_packet::<rfb::TPixel>()?;
+                        let mut framebuffer = self.framebuffer.write().unwrap();
+                        for y in 0..rectangle.height {
+                            for x in 0..rectangle.width {
+                                framebuffer.set_pixel(
+                                    x + rectangle.x,
+                                    y + rectangle.y,
+                                    color.r,
+                                    color.g,
+                                    color.b);
+                            }
+                        }
+                    },
+                    rfb::TightMethod::Basic(ref basic) => {
+                        match basic.filter {
+                            rfb::TightFilter::PaletteFilter(ref palette) => {
+                                let mut colors = Vec::with_capacity(palette.no_of_colors);
+                                for _ in 0..palette.no_of_colors {
+                                    colors.push(Rgb::from_tpixel(self.parse_packet::<rfb::TPixel>()?));
+                                }
+
+                                let stride = if palette.no_of_colors == 2 {
+                                    (rectangle.width + 7) / 8
+                                } else {
+                                    rectangle.width
+                                };
+                                let uncompressed_size = rectangle.height * stride;
+
+                                let data = self.read_zlib_data(
+                                    zlib_stream_no,
+                                    uncompressed_size)?;
+                                decoder.accept(DecodingJob::rect_from_rfb(
+                                        &rectangle,
+                                        EncodingMethod::PaletteFilter(colors, data)))?;
+                                //TODO error out if no_of_colors is 1 (in syntax?)
                             },
-                            rfb::RectanglePayload::TightRectangle(_tight) => {
-    //                            ::std::io::Read::read_exact(&mut socket, &mut bytes[..]).unwrap();
-    //                            eprintln!("received[{}] tight: ‘{:?}’", server_address, byte);
+                            _ => {
                                 unimplemented!()
-                            },
-                            rfb::RectanglePayload::CursorRectangle(_) => {
-                                //TODO parse rectangle.size
+                            }
+                        }
+                    },
+                    rfb::TightMethod::BasicNoFilterId(_) => {
+                        //TODO do the same as here for explicit copy filter
+                        let uncompressed_size = rectangle.width
+                            * rectangle.height * TPIXEL_SIZE;
+                        let data = self.read_zlib_data(
+                            zlib_stream_no,
+                            uncompressed_size)?;
+                        decoder.accept(DecodingJob::rect_from_rfb(
+                                &rectangle,
+                                EncodingMethod::CopyFilter(data)))?;
+                    },
+                    rfb::TightMethod::Jpeg(ref jpeg) => {
+                        let start = Instant::now();
+                        let bytes = self.read_bytes(jpeg.length)?;
+                        decoder.accept(DecodingJob::rect_from_rfb(
+                                &rectangle,
+                                EncodingMethod::Jpeg(bytes)))?;
+
+                        *jpeg_duration += Instant::now().duration_since(start);
+                        *jpeg_times += 1;
+                    }
+                }
+            },
+            rfb::RectanglePayload::CursorRectangle(_rect) => {
+                //TODO parse rectangle.size
+                //TODO refactor out a BitmapParser from PaletteFilter + colors = 2
 //                                let cursor_size = FbSize::new(rectangle.width, 
 //                                                              rectangle.height);
 //                                let mut cursor = Framebuffer::new();
@@ -638,85 +982,25 @@ impl<V : View> RfbConnection<V> {
 //
 
 //                                unimplemented!()
-                            },
-                            rfb::RectanglePayload::DesktopSizeRectangle(_) => {
-                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                                self.resize_fb(FbSize::new(
-                                        rectangle.width, rectangle.height));
-                            },
-                            rfb::RectanglePayload::ExtendedDesktopSizeRectangle(rect) => {
+            },
+            rfb::RectanglePayload::DesktopSizeRectangle(_) => {
 //                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                                set_desktop_size_allowed = true;
-                                if rectangle.y == rfb::EXTENDED_DESKTOP_NO_ERROR {
-                                    screen_layout = rect.screens;
-                                    self.resize_fb(FbSize::new(rectangle.width, rectangle.height));
-                                }
-                            },
-                            _ => {
-                                unimplemented!()
-                            }
-                        }
-                    }
-                    //TODO assert that frambuffer update affected whole fb?
-                    if self.config.benchmark {
-                        fps += 1;
-                        if Instant::now() >= in_1_second {
-                            let fps_without_waiting = 
-                                (fps as f64)
-                                / (1.0 - in_seconds(time_spent_waiting));
-                            let fps_without_waiting = fps_without_waiting.round();
-                            println!("{} {}", fps, fps_without_waiting);
-                            ::std::io::Write::flush(
-                                &mut ::std::io::stdout()).unwrap();
-                            fps = 0;
-                            time_spent_waiting = Duration::from_secs(0);
-                            in_1_second += Duration::from_secs(1);
-                        }
-                    }
-
-                    stopwatch.take_measurement("updating framebuffer");
-                    let fb_reference = &self.framebuffer;
-                    self.view.update_framebuffer(fb_reference.clone());
-                    stopwatch.take_measurement("updated framebuffer");
-                }, //frambuffer update (TODO move to func)
-                _ => { }
+                self.resize_fb(FbSize::new(
+                        rectangle.width, rectangle.height));
+            },
+            rfb::RectanglePayload::ExtendedDesktopSizeRectangle(rect) => {
+//                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
+                self.write_end().send(RfbWriteEvent::AllowSetDesktopSize).unwrap_or(());
+                if rectangle.y == rfb::EXTENDED_DESKTOP_NO_ERROR {
+                    self.write_end().send(RfbWriteEvent::SetScreenLayout(rect.screens)).unwrap_or(());
+                    self.resize_fb(FbSize::new(rectangle.width, rectangle.height));
+                }
+            },
+            rfb::RectanglePayload::LastRectangle(_) => {
+                return Ok(true);
             }
         }
-
-        //for a click:
-    //    write_packet(rfb::ClientToServer::PointerEvent(rfb::PointerEvent {
-    //        mask: 0,
-    //        x: 5,
-    //        y: 7
-    //    }), &mut socket)?;
-        
-
-    //    let mut buf = [0u8; 1];
-    //    socket.read_exact(&mut buf[..]).unwrap();
-    //    eprintln!("received[{}] ‘{:?}’", server_address, buf);
-
-    //	write_packet(rfb::ClientToServer::FramebufferUpdateRequest(
-    //            rfb::FramebufferUpdateRequest {
-    //                incremental: false,
-    //                x: 0,
-    //                y: 0,
-    //                width: width,
-    //                height: height
-    //            }), &mut socket);
-    //    write_packet(rfb::ClientToServer::KeyEvent(rfb::KeyEvent {
-    //        down: true,
-    //        key: ?? //see doc
-    //    }), &mut socket);
-
-        //TODO later: request pseudo-encodings
-        //TODO call exit on view instead
-        //TODO document: ClientCutText not supported
-    //    glib::idle_add(|| {
-    //        gtk::main_quit();
-    //        glib::Continue(false)
-    //    });
-
-    //    Ok(())
+        Ok(false)
     }
 }
 

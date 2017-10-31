@@ -58,7 +58,7 @@ macro_rules! packet_impl {
                 ::protocol::parsing::io_parse(&Self::parser(), buffer, input)
             }
 
-            fn write<O>(self, output : &mut O)
+            fn write<O>(self, output : O)
                 -> ::protocol::parsing::result::WriteResult
                 where O : ::std::io::Write
             {

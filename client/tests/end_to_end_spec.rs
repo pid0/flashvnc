@@ -14,12 +14,9 @@ use std::process::Command;
 use std::fs::{File,remove_dir_all,DirBuilder};
 use std::path::Path;
 
-fn write_test_image_to(path : &Path) {
-    let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, 
-                                              TEST_FB_WIDTH as i32, 
-                                              TEST_FB_HEIGHT as i32).unwrap();
-    let (width, height) = (TEST_FB_WIDTH as f64, TEST_FB_HEIGHT as f64);
-    let cr = cairo::Context::new(&surface);
+fn write_three_color_test_image(cr : &mut cairo::Context, 
+                                width : f64, height : f64)
+{
     cr.set_source_rgb(1.0, 0.0, 0.0);
     cr.rectangle(0.0, 0.0, width / 2.0, height);
     cr.fill();
@@ -31,7 +28,64 @@ fn write_test_image_to(path : &Path) {
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.rectangle(0.0, height - 10.0, width, 10.0);
     cr.fill();
-    surface.write_to_png(&mut File::create(path).unwrap()).unwrap();
+}
+fn write_all_colors_image(cr : &mut cairo::Context, width : f64, height : f64) {
+    let width = width as u32;
+    let height = height as u32;
+    let mut n = 0u32;
+    for y in 0..height {
+        for x in 0..width {
+            n += 1;
+            let r = (n & 0x00ff0000) >> 16;
+            let g = (n & 0x0000ff00) >> 8;
+            let b = n & 0x000000ff;
+            cr.set_source_rgb(r as f64 / 15.0, g as f64 / 255.0, 
+                              b as f64 / 255.0);
+            cr.rectangle(x as f64, y as f64, 1.0, 1.0);
+            cr.fill();
+        }
+    }
+}
+
+fn assert_eq_images(reference : &Path, actual : &Path, diff : &Path,
+                    exact : bool)
+{
+    let output = Command::new("compare")
+        .args(&["-metric", "mse"])
+        .args(&[reference, actual, diff])
+        .output().unwrap();
+    if output.status.success() {
+        return;
+    }
+    assert!(!exact);
+    let output = String::from_utf8(output.stderr).unwrap();
+    let words : Vec<&str> = output.split_whitespace().collect();
+    let mean_squared_error : f64 = words[0].parse().unwrap();
+
+    assert!(mean_squared_error < 6.0, "{}", mean_squared_error);
+}
+
+fn should_correctly_show_image<F>(server : &mut Server, client : &Client,
+                                  dir : &Path, name : &str, generate_image : F,
+                                  exact : bool)
+    where F : Fn(&mut cairo::Context, f64, f64) -> ()
+{
+    let reference = dir.join(&format!("{}-reference.png", name));
+    let actual = dir.join(&format!("{}-actual.png", name));
+    let diff = dir.join(&format!("{}-diff.png", name));
+
+    let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, 
+                                              TEST_FB_WIDTH as i32, 
+                                              TEST_FB_HEIGHT as i32).unwrap();
+    generate_image(&mut cairo::Context::new(&surface), 
+                   TEST_FB_WIDTH as f64, TEST_FB_HEIGHT as f64);
+    surface.write_to_png(&mut File::create(&reference).unwrap()).unwrap();
+
+    server.show_still_image(&reference);
+    std::thread::sleep(Duration::from_millis(1200));
+    client.take_screenshot(&actual);
+
+    assert_eq_images(&reference, &actual, &diff, exact);
 }
 
 fn setup() -> (TempDir, Server, Client) {
@@ -66,22 +120,18 @@ fn should_show_the_rfb_if_the_client_is_a_still_image() {
     remove_dir_all(&temp_dir).unwrap_or(());
     DirBuilder::new().create(&temp_dir).unwrap();
 
-    let reference = temp_dir.join("reference.png");
-    let actual = temp_dir.join("actual.png");
-    let diff = temp_dir.join("diff.png");
-    write_test_image_to(&reference);
-
     let mut server = Server::start(&temp_dir).unwrap();
-    server.show_still_image(&reference);
     let client = Client::start("localhost", server.port()).unwrap();
 
-    std::thread::sleep(Duration::from_millis(1200));
-    client.take_screenshot(&actual);
+    client.turn_on_lossless_compression();
+    should_correctly_show_image(&mut server, &client, &temp_dir, "all-colors",
+                                write_all_colors_image, true);
+    should_correctly_show_image(&mut server, &client, &temp_dir, "three-color",
+                                write_three_color_test_image, true);
 
-    assert!(Command::new("compare")
-        .args(&["-metric", "PSNR"])
-        .args(&[reference, actual, diff])
-        .status().unwrap().success());
+    client.turn_on_lossy_compression();
+    should_correctly_show_image(&mut server, &client, &temp_dir, "all-colors",
+                                write_all_colors_image, false);
 }
 
 #[test]

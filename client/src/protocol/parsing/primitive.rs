@@ -627,6 +627,33 @@ pub fn prefix_len_array<LengthParser, T, ItemParser>(
 }
 
 // <----------- until here
+struct ZeroLen<P>
+    where P : Parser
+{
+    p : P
+}
+impl<P> Parser for ZeroLen<P>
+    where P : Parser
+{
+    type T = P::T;
+    fn parse<'a, I>(&self, input : I) -> ParseResult<Self::T, I>
+        where I : Input<'a>
+    {
+        let original_input = input.clone();
+        let (ret, _) = self.p.parse(input)?;
+        Ok((ret, original_input))
+    }
+    fn write<O>(&self, _output : &mut O, _value : Self::T) -> WriteResult
+        where O : Output
+    {
+        Ok(())
+    }
+}
+pub fn zero_len<P>(p : P) -> impl Parser<T = P::T>
+    where P : Parser
+{
+    ZeroLen { p: p }
+}
 
 #[cfg(test)]
 mod the_u8_parser {
@@ -834,5 +861,22 @@ mod the_literal_parser {
     fn should_write_the_specified_constant_out_of_no_input() {
         let parser = literal(u16_be(), 1);
         assert_eq!(write(&parser, ()).unwrap(), [0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod the_zero_len_parser {
+    use super::*;
+    use protocol::parsing::parser_test::*;
+
+    #[test]
+    fn should_return_the_unadvanced_input() {
+        let parser = seq(zero_len(u8p()), u8p());
+        assert_eq!(parse(&parser, &[10][..]).unwrap(), (10, 10));
+    }
+
+    #[test]
+    fn should_write_nothing() {
+        assert_eq!(write(&zero_len(u8p()), 5).unwrap(), []);
     }
 }

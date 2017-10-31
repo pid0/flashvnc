@@ -2,20 +2,22 @@
 name = "flashvnc"
 version = "0.1.0"
 authors = ["Patrick Plagwitz <Patrick_Plagwitz@web.de>"]
+links = "jpeg"
+build = "build.rs"
 
 [dependencies]
 gtk = "*"
 gdk-pixbuf = "*"
 glib = "*"
-# this a dependency of only server_test_program and listed here
-# due to a limitation in Cargo
-# TODO remove this
 libc = "0.2"
-# likewise for benchmark
+# this a dependency of only benchmark and listed here
+# due to a limitation in Cargo
 # TODO remove this
 tempdir = "0.3.5"
 
 derivative = "*"
+
+flate2 = { version = "0.2", features = ["zlib"], default-features = false }
 
 [dependencies.cairo-rs]
 version = "*"
@@ -28,6 +30,9 @@ features = ["v3_20"]
 [dev-dependencies]
 libc = "0.2"
 spectral = "0.6.0"
+
+[build-dependencies]
+cc = "1.0"
 
 [[bin]]
 name = "server_test_program"

@@ -36,6 +36,6 @@ set-normal-buffers
 
 net-show
 
-RUST_BACKTRACE=1 "$binDir"/benchmark
+RUST_BACKTRACE=1 "$binDir"/benchmark "$@"
 net-clear 2>/dev/null
 set-normal-buffers

@@ -1,3 +1,5 @@
+#![feature(drop_types_in_const)]
+
 use std::process::Command;
 
 extern crate gtk;
@@ -19,6 +21,11 @@ use std::io;
 use std::cell::RefCell;
 use std::sync::{Arc,Mutex};
 use std::str::FromStr;
+
+static mut DRAWING_AREA : Option<gtk::DrawingArea> = None;
+fn get_drawing_area() -> &'static gtk::DrawingArea {
+    unsafe { DRAWING_AREA.as_mut().unwrap() }
+}
 
 struct CursorPos {
     x : u32,
@@ -73,10 +80,18 @@ fn serve(benchmark_mode : Arc<Mutex<bool>>,
             }
             "show-benchmark" => {
                 *benchmark_mode.lock().unwrap() = true;
+                glib::idle_add(move || {
+                    get_drawing_area().queue_draw();
+                    glib::Continue(false)
+                });
             }
             "show-image" => {
                 //TODO use rest of words
                 *image_file_path.lock().unwrap() = String::from(words[1]);
+                glib::idle_add(move || {
+                    get_drawing_area().queue_draw();
+                    glib::Continue(false)
+                });
             }
             "query-screen-size" => {
                 let width = Command::new("./screen-size.sh")
@@ -149,6 +164,7 @@ fn main() {
     let benchmark_mode_clone = benchmark_mode.clone();
     let image_file_path_clone = image_file_path.clone();
     let cursor_pos_clone = cursor_pos.clone();
+    let last_image_path = RefCell::new(String::new());
 
     area.connect_draw(move |ref area, ref cr| {
         let width = area.get_allocated_width() as f64;
@@ -161,10 +177,13 @@ fn main() {
 //        cr.fill();
 
         if image_file_path.lock().unwrap().len() > 0 {
+            let mut last_image_path = last_image_path.borrow_mut();
             let mut image = data.image.borrow_mut();
-            if image.is_none() {
+            if image.is_none() 
+                || *image_file_path.lock().unwrap() != *last_image_path {
                 *image = Some(Pixbuf::new_from_file(
                          &image_file_path.lock().unwrap()).unwrap());
+                *last_image_path = image_file_path.lock().unwrap().clone();
             }
             cr.set_source_pixbuf(image.as_ref().unwrap(), 0.0, 0.0);
             cr.rectangle(0.0, 0.0, width, height);
@@ -184,7 +203,7 @@ fn main() {
 
         if *benchmark_mode.lock().unwrap() {
             //::std::thread::sleep(::std::time::Duration::from_millis(10));
-            eprintln!("animation pos: {}", animation.center_pos);
+//            eprintln!("animation pos: {}", animation.center_pos);
             if animation.forwards {
                 animation.center_pos += 0.009;
                 if animation.center_pos >= 1.0 {
@@ -229,6 +248,9 @@ fn main() {
 
     println!("{}", unsafe { libc::getpid() });
 
+    unsafe {
+        DRAWING_AREA = Some(area.clone());
+    }
     std::thread::spawn(move || { 
         serve(benchmark_mode_clone, image_file_path_clone, cursor_pos_clone)
     });

@@ -1,4 +1,6 @@
-use protocol::parsing::primitive::{u8p,seq,conv,pred,utf8_with_len,dep,length,prefix_len_array,u32_be,utf8,non_zero,literal,u8_bool,u16_be,ignored,i32_be,nothing};
+use protocol::parsing::primitive::{u8p,seq,conv,pred,utf8_with_len,dep,length,prefix_len_array,u32_be,utf8,non_zero,literal,u8_bool,u16_be,ignored,i32_be,nothing,zero_len};
+use protocol::parsing::{Parser,Input,Output};
+use protocol::parsing::result::{ParseResult,WriteResult,WriteError};
 
 pub const PROTOCOL_VERSION_LEN : usize = 12;
 
@@ -17,16 +19,79 @@ const SEC_RESULT_FAILED : u32 = 1;
 
 pub const ENCODING_RAW : i32 = 0;
 pub const ENCODING_TIGHT : i32 = 7;
+
+pub const ENCODING_WORST_JPEG_QUALITY : i32 = -512;
+pub const ENCODING_BEST_JPEG_QUALITY : i32 = -412;
+pub const ENCODING_COMPRESSION_LEVEL_0 : i32 = -256;
+pub const ENCODING_CHROMA_SUBSAMPLING_1X : i32 = -768;
+pub const ENCODING_CHROMA_SUBSAMPLING_2X : i32 = -766;
+pub const ENCODING_CHROMA_SUBSAMPLING_4X : i32 = -767;
+
 pub const ENCODING_DESKTOP_SIZE : i32 = -223;
 pub const ENCODING_CURSOR : i32 = -239;
 pub const ENCODING_EXTENDED_DESKTOP_SIZE : i32 = -308;
 
+pub const ENCODING_LAST_RECT : i32 = -224;
+pub const ENCODING_CONTINUOUS_UPDATES : i32 = -313;
+pub const ENCODING_FENCE : i32 = -312;
+
 pub const EXTENDED_DESKTOP_NO_ERROR : usize = 0;
+
+pub const FENCE_BLOCK_BEFORE : u32 = 1;
+pub const FENCE_BLOCK_AFTER : u32 = 2;
+pub const FENCE_SYNC_NEXT : u32 = 4;
+pub const FENCE_REQUEST : u32 = 0x80000000;
 
 fn is_security_type(&number : &u8) -> bool {
     number == SEC_TYPE_NONE
         || number == SEC_TYPE_VNC
         || number == SEC_TYPE_TIGHT
+}
+
+//test
+struct CompactLength;
+impl Parser for CompactLength {
+    type T = usize;
+    fn parse<'a, I>(&self, mut input : I) -> ParseResult<usize, I>
+        where I : Input<'a>
+    {
+        let mut ret = 0;
+        for i in 0..3 {
+            let (byte, rest) = input.read(1)?;
+            input = rest;
+            let byte = byte[0];
+
+            let significant_bits = if i == 2 {
+                byte
+            } else {
+                byte & 0x7f
+            };
+            ret |= (significant_bits as usize) << (i * 7);
+            if byte & 0x80 == 0 {
+                return Ok((ret, input));
+            }
+        }
+        Ok((ret, input))
+    }
+    fn write<O>(&self, output : &mut O, value : usize) -> WriteResult
+        where O : Output
+    {
+        if value > 4194303 {
+            Err(WriteError::PredicateFailed("number too large"))
+        } else if value > 16383 {
+            output.write(
+                &[(value & 0x7f) as u8 | 0x80, 
+                ((value >> 7) & 0x7f) as u8 | 0x80,
+                (value >> 14) as u8])
+        } else if value > 127 {
+            output.write(&[(value & 0x7f) as u8 | 0x80, (value >> 7) as u8])
+        } else {
+            output.write(&[value as u8])
+        }
+    }
+}
+pub fn compact_length() -> impl Parser<T = usize> {
+    CompactLength { }
 }
 
 packet! { ProtocolVersion:
@@ -123,6 +188,21 @@ packet! { PointerEvent:
     [y : [u16_be()] -> u16]
 }
 
+packet! { EnableContinuousUpdates:
+    [enable : [u8_bool()] -> bool]
+    [x : [length(u16_be())] -> usize]
+    [y : [length(u16_be())] -> usize]
+    [width : [length(u16_be())] -> usize]
+    [height : [length(u16_be())] -> usize]
+}
+
+packet! { Fence:
+    [ignored : [ignored(3)] -> ()]
+    [flags : [u32_be()] -> u32]
+        //TODO predicate len <= 64
+    [payload : [prefix_len_array(u8p(), u8p())] -> Vec<u8>]
+}
+
 packet! { SetDesktopSize:
     [ignored : [ignored(1)] -> ()]
     [width : [length(u16_be())] -> usize]
@@ -138,15 +218,66 @@ tagged_meta_packet! { ClientToServer: u8p() => u8 =>
     [3] FramebufferUpdateRequest,
     [4] KeyEvent,
     [5] PointerEvent,
+    [150] EnableContinuousUpdates,
+    [248] Fence,
     [251] SetDesktopSize
+}
+
+packet! { TPixel:
+    [r : [u8p()] -> u8]
+    [g : [u8p()] -> u8]
+    [b : [u8p()] -> u8]
 }
 
 packet! { RawRectangle:
     [ignored : [nothing()] -> ()] //read bytes yourself, force client somehow?
-    //[bytes : [bytes(???)] -> Vec<u8>] //next: ???????
+}
+packet! { TightFill:
+    [control_byte : [pred(u8p(), |n| n & 0xf0 == 0b1000_0000, 
+                          "bits 7..4 must be 1000")] -> u8]
+}
+packet! { TightJpeg:
+    [control_byte : [pred(u8p(), |n| n & 0xf0 == 0b1001_0000, 
+                          "bits 7..4 must be 1001")] -> u8]
+    [length : [compact_length()] -> usize]
+}
+packet! { TightZlib:
+    //TODO note that, if the uncompressed length is less than 12, there is no compression!
+    [length : [compact_length()] -> usize]
+}
+packet! { CopyFilter:
+    [ignored : [nothing()] -> ()]
+}
+packet! { PaletteFilter:
+    [no_of_colors : [conv(u8p(), |n| (n as usize) + 1, 
+                          |n| Ok((n - 1) as u8))] -> usize]
+}
+packet! { GradientFilter:
+    [ignored : [nothing()] -> ()]
+}
+tagged_meta_packet! { TightFilter: u8p() => u8 =>
+    [0] CopyFilter,
+    [1] PaletteFilter,
+    [2] GradientFilter
+}
+packet! { TightBasicFilterId:
+    [control_byte : [pred(u8p(), |n| n & 0xc0 == 0x40, 
+                          "msb must be zero, bit 6 must be 1")] -> u8]
+    [filter : [TightFilter::parser()] -> TightFilter]
+}
+packet! { TightBasicNoFilterId:
+    [control_byte : [pred(u8p(), |n| n & 0xc0 == 0, 
+                          "msb must be zero, bit 6 must be 0")] -> u8]
+}
+meta_packet! { TightMethod:
+    Jpeg(TightJpeg),
+    Fill(TightFill),
+    Basic(TightBasicFilterId),
+    BasicNoFilterId(TightBasicNoFilterId)
 }
 packet! { TightRectangle:
-    [ignored : [nothing()] -> ()]
+    [control_byte : [zero_len(u8p())] -> u8]
+    [method : [TightMethod::parser()] -> TightMethod]
 }
 packet! { DesktopSizeRectangle:
     [ignored : [nothing()] -> ()]
@@ -168,6 +299,9 @@ packet! { ExtendedDesktopSizeRectangle:
         conv(seq(u8p(), ignored(3)), |(n, ())| n, |n| Ok((n, ()))),
         Screen::parser())] -> Vec<Screen>]
 }
+packet! { LastRectangle:
+    [ignored : [nothing()] -> ()]
+}
 //TODO solution to everything: step-by-step parsing(lazy parser)
 //packet! { TrleTile(cpixel_len : usize, width : usize, height : usize):
 //    u8p() => {
@@ -188,7 +322,8 @@ tagged_meta_packet! { RectanglePayload: i32_be() => i32 =>
     [ENCODING_TIGHT] TightRectangle,
     [ENCODING_DESKTOP_SIZE] DesktopSizeRectangle,
     [ENCODING_CURSOR] CursorRectangle,
-    [ENCODING_EXTENDED_DESKTOP_SIZE] ExtendedDesktopSizeRectangle
+    [ENCODING_EXTENDED_DESKTOP_SIZE] ExtendedDesktopSizeRectangle,
+    [ENCODING_LAST_RECT] LastRectangle
 }
 
 packet! { Rectangle:
@@ -214,8 +349,66 @@ packet! { ServerCutText:
     [string : [dep(length(u32_be()), utf8())] -> String]
 }
 
+packet! { EndOfContinuousUpdates:
+    [ignored : [nothing()] -> ()]
+}
+
 tagged_meta_packet! { ServerToClient: u8p() => u8 =>
     [0] FramebufferUpdate,
     [2] Bell,
-    [3] ServerCutText
+    [3] ServerCutText,
+    [150] EndOfContinuousUpdates,
+    [248] Fence
+}
+
+#[cfg(test)]
+mod the_compact_length_parser {
+    use super::*;
+    use protocol::parsing::parser_test::*;
+    use protocol::parsing::result::WriteError;
+
+    fn should_be_able_to_parse_from_itself(n : usize) {
+        let output = write(&compact_length(), n).unwrap();
+        assert_eq!(parse(&compact_length(), &output[..]).unwrap(), n);
+    }
+
+    #[test]
+    fn should_encode_numbers_that_fit_into_7_bits_with_1_byte() {
+        assert_eq!(parse(&compact_length(), &[0x01][..]).unwrap(), 1);
+        assert_eq!(write(&compact_length(), 1).unwrap(), [0x01]);
+
+        assert_eq!(parse(&compact_length(), &[127][..]).unwrap(), 127);
+        assert_eq!(write(&compact_length(), 127).unwrap(), [127]);
+    }
+
+    #[test]
+    fn should_encode_larger_numbers_by_prepending_bytes_starting_with_a_1() {
+        assert_eq!(write(&compact_length(), 255).unwrap(), [0xff, 0x01]);
+        should_be_able_to_parse_from_itself(255);
+        assert_eq!(write(&compact_length(), 256).unwrap(), [0x80, 0x02]);
+        should_be_able_to_parse_from_itself(256);
+
+        assert_eq!(write(&compact_length(), 10_000).unwrap(), [0x90, 0x4e]);
+        should_be_able_to_parse_from_itself(10_000);
+
+        assert_eq!(write(&compact_length(), 16384).unwrap(), 
+                   [0x80, 0x80, 0x01]);
+        should_be_able_to_parse_from_itself(16384);
+    }
+
+    #[test]
+    fn should_use_3_bytes_max_and_the_third_one_in_full() {
+        assert_eq!(write(&compact_length(), 4194303).unwrap(), 
+                   [0xff, 0xff, 0xff]);
+        should_be_able_to_parse_from_itself(4194303);
+
+        match write(&compact_length(), 4194304).unwrap_err() {
+            WriteError::PredicateFailed(error) => {
+                assert_eq!(error, "number too large");
+            },
+            _ => {
+                assert!(false);
+            }
+        }
+    }
 }

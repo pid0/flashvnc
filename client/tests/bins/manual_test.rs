@@ -19,7 +19,7 @@ fn main() {
         exec xterm -e bash --norc
     "#).unwrap();
     let mut client = Client::start_with_args("localhost", server.port(),
-        &[], Build::Release).unwrap();
+        &[], Build::Debug).unwrap();
 
     client.wait_for_termination();
 }

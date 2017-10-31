@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::str::FromStr;
 
-const VNC_START_PORT : u32 = 5900;
+const VNC_START_PORT : u16 = 5900;
 pub const TEST_FB_WIDTH : u32 = 800;
 pub const TEST_FB_HEIGHT : u32 = 600;
 
@@ -21,6 +21,7 @@ pub const KEY_CTRL_L : u32 = 0xffe3;
 pub const KEY_RETURN : u32 = 0xff0d;
 pub const KEY_F1 : u32 = 0xffbe;
 pub const KEY_F5 : u32 = 0xffc2;
+pub const KEY_F6 : u32 = 0xffc3;
 pub const KEY_F8 : u32 = 0xffc5;
 pub const KEY_SPACE : u32 = ' ' as u32;
 pub const KEY_LOWER_B : u32 = 'b' as u32;
@@ -85,8 +86,8 @@ macro_rules! assert_eq_with_timeout {
 }
 
 pub struct VncServer {
-    port : u32,
-    screen_number : u32,
+    port : u16,
+    screen_number : u16,
     process : Child
 }
 impl VncServer {
@@ -103,7 +104,7 @@ impl VncServer {
             .arg(startup_file_path)
             .spawn()?;
 
-        let vnc_screen : u32;
+        let vnc_screen : u16;
         loop {
             let latest_vnc_screen = in_project_dir("latest-vnc-screen.sh");
             let output = Command::new(latest_vnc_screen).output()?;
@@ -132,7 +133,7 @@ impl VncServer {
         Ok(())
     }
 
-    pub fn port(&self) -> u32 {
+    pub fn port(&self) -> u16 {
         self.port
     }
 }
@@ -198,7 +199,7 @@ impl Server {
         Ok((input_fifo_path.to_path_buf(), output_fifo_path.to_path_buf()))
     }
 
-    pub fn port(&self) -> u32 {
+    pub fn port(&self) -> u16 {
         self.vncserver.port()
     }
 
@@ -299,7 +300,7 @@ pub struct Client {
     process : Child
 }
 impl Client {
-    pub fn start_with_args(host : &str, port : u32, args : &[&str],
+    pub fn start_with_args(host : &str, port : u16, args : &[&str],
                            build : Build) 
         -> io::Result<Self>
     {
@@ -317,7 +318,7 @@ impl Client {
             process: process
         })
     }
-    pub fn start(host : &str, port : u32) -> io::Result<Self> {
+    pub fn start(host : &str, port : u16) -> io::Result<Self> {
         Self::start_with_args(host, port, &[], Build::Debug)
     }
 
@@ -411,7 +412,15 @@ impl Client {
 
     pub fn turn_on_relative_mouse_mode(&self) {
         self.press_and_release_key(KEY_F8);
+        self.press_and_release_key(KEY_F6);
+    }
+    pub fn turn_on_lossless_compression(&self) {
+        self.press_and_release_key(KEY_F8);
         self.press_and_release_key(KEY_F5);
+    }
+    pub fn turn_on_lossy_compression(&self) {
+        self.press_and_release_key(KEY_F8);
+        self.press_and_release_key(KEY_F1);
     }
 
     pub fn wait_for_termination(&mut self) {

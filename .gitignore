@@ -6,3 +6,5 @@
 /concept-*
 Session*.vim
 target/
+/test-*
+/*dump

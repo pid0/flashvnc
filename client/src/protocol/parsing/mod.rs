@@ -5,7 +5,7 @@ pub mod packet;
 pub mod primitive;
 pub mod io_input;
 #[cfg(test)]
-mod parser_test;
+pub mod parser_test;
 
 use std::io;
 use std::cell::{RefCell,Ref};
@@ -21,22 +21,22 @@ pub trait Output {
     fn write(&mut self, bytes : &[u8]) -> WriteResult;
 }
 //TODO move to own file
-pub struct IoOutput<'a, T>
-    where T : io::Write + 'a
+pub struct IoOutput<T>
+    where T : io::Write
 {
-    writer : &'a mut T
+    writer : T
 }
-impl<'a, T> IoOutput<'a, T>
-    where T : io::Write + 'a
+impl<T> IoOutput<T>
+    where T : io::Write
 {
-    pub fn new(writer : &'a mut T) -> Self {
+    pub fn new(writer : T) -> Self {
         IoOutput {
             writer: writer
         }
     }
 }
-impl<'a, T> Output for IoOutput<'a, T>
-    where T : io::Write + 'a
+impl<T> Output for IoOutput<T>
+    where T : io::Write
 {
     fn write(&mut self, bytes : &[u8]) -> WriteResult {
         self.writer.write_all(bytes)?;
@@ -76,7 +76,7 @@ pub trait Parser {
 pub trait Packet : Sized {
     fn parse<I>(buffer : &SharedBuf, input : I) -> ParseEndResult<Self>
         where I : io::Read;
-    fn write<O>(self, output : &mut O) -> WriteResult
+    fn write<O>(self, output : O) -> WriteResult
         where O : io::Write;
     fn name() -> &'static str;
 }
@@ -97,7 +97,7 @@ pub fn io_parse<P, I>(parser : &P, buffer : &SharedBuf, input : I)
     }
 }
 
-pub fn io_write<P, O>(parser : &P, output : &mut O, value : P::T) -> WriteResult
+pub fn io_write<P, O>(parser : &P, output : O, value : P::T) -> WriteResult
     where P : Parser,
           O : io::Write
 {
