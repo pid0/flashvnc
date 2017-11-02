@@ -18,17 +18,23 @@ extern crate libc;
 
 use std::io;
 use std::io::{BufReader,BufWriter,Read,Write};
-use std::ptr;
 //use std::io::{Read,Write};
 use std::net::{TcpStream,UdpSocket};
 use std::sync::mpsc;
+
+pub mod infrastructure;
 
 mod presentation;
 use presentation::gtk as gtk_frontend;
 
 pub mod protocol;
+
+mod framebuffer;
+pub use framebuffer::{Rgb,FbSize,Framebuffer,FbSlice,FbRawParts,FbPointerSlice};
+pub type SharedFb = Arc<RwLock<Framebuffer>>;
+
 mod encoding;
-use encoding::{DecodingJob,DecodingMaster,EncodingMethod,TightData};
+use encoding::{DecodingJob,DecodingMaster,EncodingMethod,TightData,FbLock};
 mod tight;
 
 use protocol::rfb;
@@ -189,24 +195,6 @@ impl CursorDifference {
 //    }
 //}
 
-//TODO move to different file
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FbSize {
-    width: usize, 
-    height: usize
-}
-impl FbSize {
-    pub fn new(width : usize, height : usize) -> Self {
-        Self {
-            width: width,
-            height: height
-        }
-    }
-    pub fn no_of_pixels(&self) -> usize {
-        self.width * self.height
-    }
-}
-type SharedFb = Arc<RwLock<Framebuffer>>;
 pub enum ProtocolEvent {
     ChangeDisplaySize(FbSize),
     UpdateFramebuffer(SharedFb),
@@ -259,6 +247,27 @@ pub struct MainError(pub String);
 impl From<io::Error> for MainError {
     fn from(err : io::Error) -> Self {
         MainError(format!("I/O error: {:?}", err))
+    }
+}
+impl<E> From<infrastructure::thread_pool::Error<E>> for MainError 
+    where MainError : From<E>
+{
+    fn from(err : infrastructure::thread_pool::Error<E>) -> Self {
+        use infrastructure::thread_pool::Error::*;
+        match err {
+            Panic => MainError(String::from("panic while decoding")),
+            Value(e) => MainError::from(e)
+        }
+    }
+}
+impl<E> From<Vec<E>> for MainError 
+    where MainError : From<E>
+{
+    fn from(mut errors : Vec<E>) -> Self {
+        let ret = String::from("multiple errors: ");
+        let strings : Vec<_> = errors.drain(..).map(|e| MainError::from(e).0)
+            .collect();
+        MainError(ret + &strings.join(",\n"))
     }
 }
 
@@ -322,78 +331,6 @@ pub fn handle_connection<V : View>(
     view : V) -> Result<(), MainError>
 {
     RfbConnection::new(config, socket, view).handle()
-}
-
-#[repr(C)]
-pub struct Rgb {
-    pub r : u8,
-    pub g : u8,
-    pub b : u8
-}
-impl Rgb {
-    pub fn from_tpixel(tpixel : rfb::TPixel) -> Self {
-        Self {
-            r: tpixel.r,
-            g: tpixel.g,
-            b: tpixel.b,
-        }
-    }
-}
-
-pub struct Framebuffer {
-    data : Vec<u8>,
-    size : FbSize
-}
-impl Framebuffer {
-    fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            size: FbSize::new(0, 0)
-        }
-    }
-
-    fn resize(&mut self, new_size : FbSize) {
-        //TODO pixel data is not correctly transferred in this way (you must crop right-most columns and
-        //bottom-most rows)
-        self.size = new_size;
-        let new_len = VIEW_PIXEL_FORMAT.bytes_per_pixel 
-            * new_size.no_of_pixels();
-        let gray = 0xe0u8;
-        self.data.resize(new_len, gray);
-    }
-
-    pub fn size(&self) -> FbSize {
-        self.size
-    }
-
-    pub fn data(&self) -> &Vec<u8> {
-        &self.data
-    }
-
-    fn stride(&self) -> usize {
-        VIEW_PIXEL_FORMAT.bytes_per_pixel * self.size.width
-    }
-    fn byte_pos(&self, x : usize, y : usize) -> usize {
-        y * self.stride() + x * VIEW_PIXEL_FORMAT.bytes_per_pixel
-    }
-
-    fn set_pixel(&mut self, x : usize, y : usize,
-                 r : u8, g : u8, b : u8) {
-        let pos = self.byte_pos(x, y);
-        self.data[pos] = r;
-        self.data[pos + 1] = g;
-        self.data[pos + 2] = b;
-    }
-
-    fn set_line(&mut self, x : usize, width : usize, y : usize, line : &[Rgb]) {
-        assert!(x + width <= self.size.width);
-        assert!(y <= self.size.height);
-        let pos = self.byte_pos(x, y);
-        unsafe {
-            let data = self.data.as_mut_ptr().offset(pos as isize) as *mut Rgb;
-            ptr::copy_nonoverlapping(line.as_ptr(), data, width);
-        }
-    }
 }
 
 enum RfbWriteEvent {
@@ -542,10 +479,10 @@ impl RfbWriteEnd {
 }
 
 fn disable_nagles_algo(socket : &TcpStream) -> io::Result<()> {
-    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::io::AsRawFd;
 
     let one : libc::c_int = 1;
-    let socket_fd = socket.try_clone().unwrap().into_raw_fd();
+    let socket_fd = socket.as_raw_fd();
     let ret;
     unsafe {
         ret = libc::setsockopt(
@@ -709,7 +646,7 @@ impl<V : View> RfbConnection<V> {
         //TODO non-blocking select between GUI and server? (use try_recv for mpsc)
         //TODO first: decode everything here, then: use worker threads and *benchmark this*!
         
-        let mut decoder = DecodingMaster::new(self.framebuffer.clone());
+        let decoder = DecodingMaster::new(self.framebuffer.clone());
 
         let mut jpeg_duration = Duration::from_secs(0);
         let mut jpeg_times = 0;
@@ -757,6 +694,9 @@ impl<V : View> RfbConnection<V> {
 //        }).unwrap_or(());
         let start = Instant::now();
 
+        let mut fb_lock = None;
+        let mut maybe_new_fb_size = None;
+
         let mut in_1_second = Instant::now() + Duration::from_secs(1);
         let mut fps : f64 = 0.0;
         let mut time_spent_waiting = Duration::from_secs(0);
@@ -788,8 +728,11 @@ impl<V : View> RfbConnection<V> {
                 rfb::ServerToClient::FramebufferUpdate(update) => {
                     stopwatch.take_measurement("update");
                     let mut area = 0.0;
+
                     //TODO not required if continuous updates are enabled
 //                    self.send_fb_update_request(true);
+
+                    fb_lock = Some(decoder.lock_framebuffer());
 
 //                    eprintln!("received[{}] ‘{:?}’", server_address, update);
                     let _before_decoding = Instant::now();
@@ -799,15 +742,24 @@ impl<V : View> RfbConnection<V> {
                         area += rectangle.width as f64 
                             * rectangle.height as f64;
 //                        eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                        if self.handle_rectangle(&mut decoder, rectangle,
-                                                 &mut time_spent_waiting,
-                                                 &mut jpeg_duration,
-                                                 &mut jpeg_times)? {
+                        let (last_rect, new_fb_size) = 
+                            self.handle_rectangle(
+                                fb_lock.as_ref().unwrap(), 
+                                &decoder, 
+                                rectangle, 
+                                &mut time_spent_waiting, 
+                                &mut jpeg_duration, 
+                                &mut jpeg_times)?;
+                        if let Some(new_fb_size) = new_fb_size {
+                            maybe_new_fb_size = Some(new_fb_size);
+                        }
+                        if last_rect {
                             break;
                         }
                     }
 //                    eprintln!("decoding took {}", in_seconds(
 //                            Instant::now().duration_since(_before_decoding)));
+                    decoder.finish(fb_lock.take().unwrap())?;
 
                     if self.config.benchmark {
                         let fb_area = self.fb_size().width as f64
@@ -830,6 +782,10 @@ impl<V : View> RfbConnection<V> {
                         }
                     }
 
+                    if let Some(new_fb_size) = maybe_new_fb_size {
+                        self.resize_fb(new_fb_size);
+                        maybe_new_fb_size = None;
+                    }
                     stopwatch.take_measurement("updating framebuffer");
                     let fb_reference = &self.framebuffer;
                     self.view.update_framebuffer(fb_reference.clone());
@@ -854,13 +810,14 @@ impl<V : View> RfbConnection<V> {
         }
     }
 
-    fn handle_rectangle(&mut self,
-                        decoder : &mut DecodingMaster,
-                        rectangle : rfb::Rectangle,
-                        time_spent_waiting : &mut Duration,
-                        jpeg_duration : &mut Duration,
-                        jpeg_times : &mut u32)
-        -> Result<bool, MainError>
+    fn handle_rectangle<'a>(&mut self,
+                            fb_lock : &FbLock<'a>,
+                            decoder : &DecodingMaster,
+                            rectangle : rfb::Rectangle,
+                            time_spent_waiting : &mut Duration,
+                            jpeg_duration : &mut Duration,
+                            jpeg_times : &mut u32)
+        -> Result<(bool, Option<FbSize>), MainError>
     {
         match rectangle.payload {
             //TODO refactor to e.g. rfb::rect::Raw with a pub type
@@ -874,23 +831,23 @@ impl<V : View> RfbConnection<V> {
                 let bytes = self.read_bytes(size)?;
                 *time_spent_waiting += Instant::now().duration_since(start);
 
-                decoder.accept(DecodingJob::rect_from_rfb(
+                decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
                         &rectangle,
-                        EncodingMethod::RawBgra(bytes)))?;
+                        EncodingMethod::RawBgra(bytes)));
             },
             rfb::RectanglePayload::TightRectangle(ref payload) => {
                 let zlib_reset_map = payload.control_byte & 0x0f;
                 if zlib_reset_map & 0x01 != 0 {
-                    decoder.accept(DecodingJob::ResetZlib(0))?;
+                    decoder.accept(fb_lock, DecodingJob::ResetZlib(0));
                 }
                 if zlib_reset_map & 0x02 != 0 {
-                    decoder.accept(DecodingJob::ResetZlib(1))?;
+                    decoder.accept(fb_lock, DecodingJob::ResetZlib(1));
                 }
                 if zlib_reset_map & 0x04 != 0 {
-                    decoder.accept(DecodingJob::ResetZlib(2))?;
+                    decoder.accept(fb_lock, DecodingJob::ResetZlib(2));
                 }
                 if zlib_reset_map & 0x08 != 0 {
-                    decoder.accept(DecodingJob::ResetZlib(3))?;
+                    decoder.accept(fb_lock, DecodingJob::ResetZlib(3));
                 }
                 let zlib_stream_no = (payload.control_byte & 0x30) >> 4;
                 let zlib_stream_no = zlib_stream_no as usize;
@@ -898,17 +855,11 @@ impl<V : View> RfbConnection<V> {
                 match payload.method {
                     rfb::TightMethod::Fill(_) => {
                         let color = self.parse_packet::<rfb::TPixel>()?;
-                        let mut framebuffer = self.framebuffer.write().unwrap();
-                        for y in 0..rectangle.height {
-                            for x in 0..rectangle.width {
-                                framebuffer.set_pixel(
-                                    x + rectangle.x,
-                                    y + rectangle.y,
-                                    color.r,
-                                    color.g,
-                                    color.b);
-                            }
-                        }
+                        decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
+                                &rectangle,
+                                EncodingMethod::Fill(
+                                    Rgb::from_tpixel(color))
+                                ));
                     },
                     rfb::TightMethod::Basic(ref basic) => {
                         match basic.filter {
@@ -928,9 +879,9 @@ impl<V : View> RfbConnection<V> {
                                 let data = self.read_zlib_data(
                                     zlib_stream_no,
                                     uncompressed_size)?;
-                                decoder.accept(DecodingJob::rect_from_rfb(
+                                decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
                                         &rectangle,
-                                        EncodingMethod::PaletteFilter(colors, data)))?;
+                                        EncodingMethod::PaletteFilter(colors, data)));
                                 //TODO error out if no_of_colors is 1 (in syntax?)
                             },
                             _ => {
@@ -945,16 +896,16 @@ impl<V : View> RfbConnection<V> {
                         let data = self.read_zlib_data(
                             zlib_stream_no,
                             uncompressed_size)?;
-                        decoder.accept(DecodingJob::rect_from_rfb(
+                        decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
                                 &rectangle,
-                                EncodingMethod::CopyFilter(data)))?;
+                                EncodingMethod::CopyFilter(data)));
                     },
                     rfb::TightMethod::Jpeg(ref jpeg) => {
                         let start = Instant::now();
                         let bytes = self.read_bytes(jpeg.length)?;
-                        decoder.accept(DecodingJob::rect_from_rfb(
+                        decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
                                 &rectangle,
-                                EncodingMethod::Jpeg(bytes)))?;
+                                EncodingMethod::Jpeg(bytes)));
 
                         *jpeg_duration += Instant::now().duration_since(start);
                         *jpeg_times += 1;
@@ -985,22 +936,23 @@ impl<V : View> RfbConnection<V> {
             },
             rfb::RectanglePayload::DesktopSizeRectangle(_) => {
 //                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
-                self.resize_fb(FbSize::new(
-                        rectangle.width, rectangle.height));
+                return Ok((false, Some(FbSize::new(rectangle.width, 
+                                                   rectangle.height))));
             },
             rfb::RectanglePayload::ExtendedDesktopSizeRectangle(rect) => {
 //                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
                 self.write_end().send(RfbWriteEvent::AllowSetDesktopSize).unwrap_or(());
                 if rectangle.y == rfb::EXTENDED_DESKTOP_NO_ERROR {
                     self.write_end().send(RfbWriteEvent::SetScreenLayout(rect.screens)).unwrap_or(());
-                    self.resize_fb(FbSize::new(rectangle.width, rectangle.height));
+                    return Ok((false, Some(FbSize::new(rectangle.width,
+                                                       rectangle.height))));
                 }
             },
             rfb::RectanglePayload::LastRectangle(_) => {
-                return Ok(true);
+                return Ok((true, None));
             }
         }
-        Ok(false)
+        Ok((false, None))
     }
 }
 

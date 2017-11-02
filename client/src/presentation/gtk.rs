@@ -1,5 +1,5 @@
 use ::{GuiEvent,ProtocolEvent,socket_thread_main,View,ConnectionConfig,
-       MainError,FbSize,EncodingQuality};
+       MainError,FbSize,EncodingQuality,FbSlice};
 
 use gtk;
 use gdk;
