@@ -47,9 +47,17 @@ struct View {
     events_in : Option<mpsc::Receiver<flashvnc::GuiEvent>>
 }
 impl flashvnc::View for View {
+    type Output = ViewOutput;
     fn get_events(&mut self) -> mpsc::Receiver<flashvnc::GuiEvent> {
         self.events_in.take().unwrap()
     }
+    fn get_output(&self) -> &ViewOutput {
+        unimplemented!()
+    }
+}
+#[derive(Clone)]
+struct ViewOutput;
+impl flashvnc::ViewOutput for ViewOutput {
     fn handle_event(&self, _event : flashvnc::ProtocolEvent) {
         unimplemented!()
     }

@@ -20,6 +20,9 @@ impl FbSize {
     pub fn no_of_bytes(&self) -> usize {
         self.no_of_pixels() * VIEW_PIXEL_FORMAT.bytes_per_pixel
     }
+    pub fn stride(&self) -> usize {
+        VIEW_PIXEL_FORMAT.bytes_per_pixel * self.width
+    }
 }
 
 #[repr(C)]
@@ -42,11 +45,8 @@ pub trait FbSlice {
     fn size(&self) -> FbSize;
     fn bytes(&mut self) -> &mut [u8];
 
-    fn stride(&self) -> usize {
-        VIEW_PIXEL_FORMAT.bytes_per_pixel * self.size().width
-    }
     fn byte_pos(&self, x : usize, y : usize) -> usize {
-        y * self.stride() + x * VIEW_PIXEL_FORMAT.bytes_per_pixel
+        y * self.size().stride() + x * VIEW_PIXEL_FORMAT.bytes_per_pixel
     }
 
     fn set_pixel(&mut self, x : usize, y : usize,
@@ -108,7 +108,7 @@ impl FbSlice for Framebuffer {
     }
 }
 
-pub struct FbRawParts(*const u8, FbSize);
+pub struct FbRawParts(pub *const u8, pub FbSize);
 unsafe impl Send for FbRawParts { }
 pub struct FbPointerSlice<'a> {
     data : &'a mut [u8],

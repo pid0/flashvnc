@@ -44,6 +44,32 @@ impl<E : Value> Drop for Future<E> {
     }
 }
 
+#[must_use]
+pub struct FutureCollection<E : Value> {
+    futures : Vec<Future<E>>
+}
+impl<E : Value> FutureCollection<E> {
+    pub fn new(futures : Vec<Future<E>>) -> Self {
+        Self {
+            futures: futures
+        }
+    }
+
+    pub fn wait(mut self) -> Result<(), Vec<Error<E>>> {
+        let mut errors = Vec::new();
+        for future in self.futures.drain(..) {
+            if let Err(err) = future.wait() {
+                errors.push(err);
+            }
+        }
+        if errors.len() == 0 {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 struct AssertSend<T> {
     t : PhantomData<T>
 }
@@ -133,6 +159,7 @@ impl<S : 'static> ThreadPool<S> {
                     let state = {
                         (init_state.lock().unwrap())()
                     };
+                    drop(init_state);
                     worker_main(job_receiver, state); 
                 }).unwrap();
             threads.push(thread);

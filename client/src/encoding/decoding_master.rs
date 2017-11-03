@@ -1,25 +1,27 @@
 use ::{SharedFb,FbSize,MainError,Rgb,PIXEL_FORMAT_BYTES_PER_PIXEL,Framebuffer,
-       FbSlice,FbRawParts,FbPointerSlice};
+       FbSlice,FbRawParts,FbPointerSlice,Cursor,CursorSize,Hotspot};
 use std::io;
 use protocol::rfb;
 
-use std::sync::RwLockWriteGuard;
+use std::sync::{Arc,Mutex,RwLockWriteGuard};
 use std::cell::RefCell;
 
 use tight::ZlibDecoder;
 use tight::jpeg::Decoder as JpegDecoder;
 
-use infrastructure::thread_pool::{ThreadPool,Future};
-use infrastructure::thread_pool::Error as ThreadPoolError;
-
-type JobError = ThreadPoolError<MainError>;
+use infrastructure::thread_pool::{ThreadPool,Future,FutureCollection};
+use infrastructure::BitBuffer;
 
 pub enum EncodingMethod {
     RawBgra(Vec<u8>),
     CopyFilter(TightData),
     PaletteFilter(Vec<Rgb>, TightData),
     Jpeg(Vec<u8>),
-    Fill(Rgb)
+    Fill(Rgb),
+    CursorBgrx {
+        pixels: Vec<u8>,
+        bitmask: Vec<u8>
+    }
 }
 
 pub enum TightData {
@@ -75,7 +77,7 @@ pub struct FbLock<'a> {
     lock : RwLockWriteGuard<'a, Framebuffer>
 }
 impl<'a> FbLock<'a> {
-    fn get_raw_parts(&self) -> FbRawParts {
+    pub fn get_raw_parts(&self) -> FbRawParts {
         self.lock.get_raw_parts()
     }
 }
@@ -93,7 +95,10 @@ impl Decoders {
     }
 }
 
-type DecoderPool = ThreadPool<Decoders>;
+type SharedCursor = Arc<Mutex<Cursor>>;
+type State = (Decoders, SharedCursor);
+
+type DecoderPool = ThreadPool<State>;
 
 pub struct DecodingMaster {
     framebuffer : SharedFb,
@@ -102,15 +107,24 @@ pub struct DecodingMaster {
     futures : RefCell<Vec<Future<MainError>>>
 }
 impl DecodingMaster {
-    pub fn new(fb : SharedFb) -> Self {
+    pub fn new(fb : SharedFb, cursor : SharedCursor) -> Self {
+        let cursor_clone_1 = cursor.clone();
+        let cursor_clone_2 = cursor.clone();
+        let cursor_clone_3 = cursor.clone();
+        let cursor_clone_4 = cursor.clone();
+
         let general_decoders = ThreadPool::new(
             "general-decoder",
-            4, || Decoders::new());
+            4, move || (Decoders::new(), cursor.clone()));
         let zlib_decoders = [
-            ThreadPool::new("zlib-decoder-1", 1, || Decoders::new()),
-            ThreadPool::new("zlib-decoder-2", 1, || Decoders::new()),
-            ThreadPool::new("zlib-decoder-3", 1, || Decoders::new()),
-            ThreadPool::new("zlib-decoder-4", 1, || Decoders::new())];
+            ThreadPool::new("zlib-decoder-1", 1, move ||
+                            (Decoders::new(), cursor_clone_1.clone())),
+            ThreadPool::new("zlib-decoder-2", 1, move ||
+                            (Decoders::new(), cursor_clone_2.clone())),
+            ThreadPool::new("zlib-decoder-3", 1, move ||
+                            (Decoders::new(), cursor_clone_3.clone())),
+            ThreadPool::new("zlib-decoder-4", 1, move ||
+                            (Decoders::new(), cursor_clone_4.clone()))];
 
         Self {
             framebuffer: fb,
@@ -129,13 +143,14 @@ impl DecodingMaster {
     fn spawn_job(&self, pool : &DecoderPool, fb_lock : &FbLock,
                  bounds : Bounds, method : EncodingMethod) {
         let fb_raw_parts = fb_lock.get_raw_parts();
-        self.futures.borrow_mut().push(pool.spawn_fn(move |decoders| {
-            decode(
-                fb_raw_parts,
-                &mut decoders.zlib_decoder,
-                &mut decoders.jpeg_decoder,
-                bounds, method)
-        }));
+        self.futures.borrow_mut().push(pool.spawn_fn(
+                move |&mut (ref mut decoders, ref mut cursor)| { 
+                    decode(
+                        fb_raw_parts, &cursor,
+                        &mut decoders.zlib_decoder,
+                        &mut decoders.jpeg_decoder,
+                        bounds, method) 
+                }));
     }
 
     pub fn accept(&self, fb_lock : &FbLock, job : DecodingJob) {
@@ -162,32 +177,24 @@ impl DecodingMaster {
             },
             ResetZlib(stream_number) => {
                 let pool = &self.zlib_decoders[stream_number];
-                self.futures.borrow_mut().push(pool.spawn_fn(|decoders| {
-                    decoders.zlib_decoder.reset();
-                    Ok(())
-                }));
+                self.futures.borrow_mut().push(pool.spawn_fn(
+                        |&mut (ref mut decoders, _)| { 
+                            decoders.zlib_decoder.reset(); 
+                            Ok(()) 
+                        }));
             }
         }
     }
 
-    pub fn finish(&self, _lock : FbLock) -> Result<(), Vec<JobError>> {
-        let mut errors = Vec::new();
+    pub fn finish(&self) -> FutureCollection<MainError> {
         let mut futures = self.futures.borrow_mut();
-        for future in futures.drain(..) {
-            if let Err(err) = future.wait() {
-                errors.push(err);
-            }
-        }
-        if errors.len() == 0 {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        let ret = FutureCollection::new(futures.drain(..).collect());
+        ret
     }
 }
 
-fn decode(fb_parts : FbRawParts, zlib_decoder : &mut ZlibDecoder,
-          jpeg_decoder : &mut JpegDecoder,
+fn decode(fb_parts : FbRawParts, cursor : &SharedCursor,
+          zlib_decoder : &mut ZlibDecoder, jpeg_decoder : &mut JpegDecoder,
           bounds : Bounds,
           method : EncodingMethod) -> Result<(), MainError>
 {
@@ -261,28 +268,17 @@ fn decode(fb_parts : FbRawParts, zlib_decoder : &mut ZlibDecoder,
             let data = uncompress(zlib_decoder, &data)?;
 
             if colors.len() == 2 {
-                let mut i = 0;
+                let mut bits = BitBuffer::new(data);
                 for y in 0..bounds.height() {
-                    let mut bit = 0;
-                    let mut byte = 0;
+                    bits.next_byte();
                     for x in 0..bounds.width() {
-                        if bit == 0 {
-                            byte = data[i as usize];
-                            i += 1;
-                        }
-
-                        let color = &colors[((byte & 0x80) >> 7) as usize];
-                        byte <<= 1;
+                        let color = &colors[bits.next() as usize];
                         fb.set_pixel(
                             x + bounds.x,
                             y + bounds.y,
                             color.r,
                             color.g,
                             color.b);
-                        bit += 1;
-                        if bit == 8 {
-                            bit = 0;
-                        }
                     }
                 }
             } else {
@@ -320,6 +316,26 @@ fn decode(fb_parts : FbRawParts, zlib_decoder : &mut ZlibDecoder,
                     line);
                 y += 1;
             }
+        },
+
+        CursorBgrx { pixels, bitmask } => {
+            let mut rgba = Vec::with_capacity(pixels.len());
+            let mut bits = BitBuffer::new(&bitmask[..]);
+            let mut i = 0;
+            for _ in 0..bounds.height() {
+                for _ in 0..bounds.width() {
+                    rgba.push(pixels[i + 2]);
+                    rgba.push(pixels[i + 1]);
+                    rgba.push(pixels[i + 0]);
+                    rgba.push(bits.next() * 255);
+                    i += PIXEL_FORMAT_BYTES_PER_PIXEL;
+                }
+                bits.next_byte();
+            }
+            let mut cursor = cursor.lock().unwrap();
+            cursor.change_data(rgba, 
+                               CursorSize(bounds.width(), bounds.height()),
+                               Hotspot(bounds.x, bounds.y));
         }
     }
 
@@ -337,29 +353,3 @@ fn uncompress<'a, 'b : 'a>(decoder : &'b mut ZlibDecoder, data : &'a TightData)
         }
     })
 }
-
-//struct ZlibDecoders {
-//    decoders : [ZlibDecoder; 4]
-//}
-//impl ZlibDecoders {
-//    fn new() -> Self {
-//        Self {
-//            decoders: zlib_decoders
-//        }
-//    }
-//
-//    fn reset(&mut self, stream_number : usize) {
-//        self.decoders[stream_number].reset();
-//    }
-//
-//    fn uncompress<'a, 'b : 'a>(&'b mut self, data : &'a TightData)
-//        -> io::Result<&'a [u8]>
-//    {
-//        Ok(match *data {
-//            TightData::UncompressedRgb(ref bytes) => &bytes[..],
-//            TightData::CompressedRgb { stream_no, ref bytes } => {
-//                self.decoders[stream_no].decode(&bytes[..])?
-//            }
-//        })
-//    }
-//}

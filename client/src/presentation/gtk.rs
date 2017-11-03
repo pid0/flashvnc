@@ -1,5 +1,5 @@
 use ::{GuiEvent,ProtocolEvent,socket_thread_main,View,ConnectionConfig,
-       MainError,FbSize,EncodingQuality,FbSlice};
+       MainError,FbSize,EncodingQuality,ViewOutput};
 
 use gtk;
 use gdk;
@@ -29,6 +29,8 @@ const KEY_F6 : u32 = 0xffc3;
 const KEY_F8 : u32 = 0xffc5;
 const KEY_F11 : u32 = 0xffc8;
 
+const COLORSPACE_RGB : i32 = 0;
+
 struct GtkContext {
     connection_in : mpsc::Receiver<ProtocolEvent>,
     window : gtk::Window,
@@ -55,18 +57,33 @@ fn handle_protocol_event(event : ProtocolEvent) {
             context.window.resize(size.width as i32,
                                   size.height as i32);
         },
-        ProtocolEvent::UpdateFramebuffer(new_fb) => {
+        ProtocolEvent::UpdateFramebuffer(new_fb_data, size) => {
 //            eprintln!("updating GUI framebuffer {:?}", ::std::time::Instant::now());
-            let new_fb = new_fb.read().unwrap();
-            let fb_copy = new_fb.data().clone();
-            let size = new_fb.size();
-            let pixbuf = Pixbuf::new_from_vec(fb_copy, 0, false, 8, 
+            let pixbuf = Pixbuf::new_from_vec(new_fb_data, COLORSPACE_RGB,
+                                              false, 8, 
                                               size.width as i32,
                                               size.height as i32,
-                                              3 * (size.width as i32)); //TODO use constant for 3
+                                              size.stride() as i32);
             context.pixbuf = pixbuf;
             drawing_area.queue_draw();
 //            eprintln!("updated GUI framebuffer {:?}", ::std::time::Instant::now());
+        },
+        ProtocolEvent::UpdateCursor(rgba, size, hotspot) => {
+            let window = drawing_area.get_window().unwrap();
+            if size.0 > 0 {
+                let display = gdk::Display::get_default().unwrap();
+                let pixbuf = Pixbuf::new_from_vec(
+                    rgba, COLORSPACE_RGB, true, 8,
+                    size.0 as i32, size.1 as i32,
+                    (4 * size.0) as i32);
+                let cursor = gdk::Cursor::new_from_pixbuf(
+                    &display, &pixbuf, 
+                    hotspot.0 as i32, hotspot.1 as i32);
+
+                window.set_cursor(Some(&cursor));
+            } else {
+                window.set_cursor(None);
+            }
         },
         ProtocolEvent::SetTitle(title) => {
             context.window.set_title(&format!("{} — flashvnc", title));
@@ -75,9 +92,23 @@ fn handle_protocol_event(event : ProtocolEvent) {
 }
 struct GtkView {
     events_in : Option<mpsc::Receiver<GuiEvent>>,
-    events_out : mpsc::Sender<ProtocolEvent>
+    output : GtkViewOutput
 }
 impl View for GtkView {
+    type Output = GtkViewOutput;
+
+    fn get_events(&mut self) -> mpsc::Receiver<GuiEvent> {
+        self.events_in.take().unwrap()
+    }
+    fn get_output(&self) -> &GtkViewOutput {
+        &self.output
+    }
+}
+#[derive(Clone)]
+struct GtkViewOutput {
+    events_out : mpsc::Sender<ProtocolEvent>
+}
+impl ViewOutput for GtkViewOutput {
     fn handle_event(&self, event : ProtocolEvent) {
         self.events_out.send(event).unwrap();
         glib::idle_add(|| {
@@ -86,9 +117,6 @@ impl View for GtkView {
             }
             glib::Continue(false)
         });
-    }
-    fn get_events(&mut self) -> mpsc::Receiver<GuiEvent> {
-        self.events_in.take().unwrap()
     }
 }
 
@@ -397,7 +425,6 @@ pub fn run(config : ConnectionConfig) {
     set_expand(&area);
     window.add(&area);
 
-//    let colorspace_rgb = 0;
     area.connect_draw(move |ref area, ref cr| {
         let width = area.get_allocated_width() as f64;
         let height = area.get_allocated_height() as f64;
@@ -467,7 +494,7 @@ pub fn run(config : ConnectionConfig) {
             window: window.clone(),
             drawing_area: area.clone(),
             pixbuf: Pixbuf::new_from_vec(
-                    one_pixel_fb, 0, false, 8, 1, 1, 3), //TODO use constant
+                    one_pixel_fb, COLORSPACE_RGB, false, 8, 1, 1, 3),
             relative_mouse_mode: false,
             f8_pressed: false,
             fullscreen: false
@@ -475,7 +502,9 @@ pub fn run(config : ConnectionConfig) {
     }
     let view = GtkView {
         events_in: Some(gui_events_rx),
-        events_out: protocol_events_tx
+        output: GtkViewOutput {
+            events_out: protocol_events_tx
+        }
     };
     std::thread::spawn(move || {
         let main_result = socket_thread_main(config, view);

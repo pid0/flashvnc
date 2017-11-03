@@ -23,6 +23,7 @@ use std::net::{TcpStream,UdpSocket};
 use std::sync::mpsc;
 
 pub mod infrastructure;
+use infrastructure::thread_pool::{ThreadPool,Future};
 
 mod presentation;
 use presentation::gtk as gtk_frontend;
@@ -41,7 +42,7 @@ use protocol::rfb;
 use protocol::parsing::io_input::SharedBuf;
 use protocol::parsing::Packet;
 use std::cell::RefCell;
-use std::sync::{Arc,RwLock};
+use std::sync::{Arc,RwLock,Mutex};
 use std::time::{Duration,Instant};
 use std::str::FromStr;
 
@@ -119,7 +120,7 @@ fn get_rfb_encodings(encoding_quality : EncodingQuality) -> Vec<i32> {
             rfb::ENCODING_TIGHT,
             rfb::ENCODING_RAW,
             
-            //rfb::ENCODING_CURSOR,
+            rfb::ENCODING_CURSOR,
             rfb::ENCODING_EXTENDED_DESKTOP_SIZE,
 
             rfb::ENCODING_LAST_RECT,
@@ -148,6 +149,59 @@ pub enum GuiEvent {
     },
     SetEncodingQuality(EncodingQuality),
     Resized(FbSize)
+}
+
+#[derive(Clone, Copy)]
+pub struct Hotspot(pub usize, pub usize);
+#[derive(Clone, Copy)]
+pub struct CursorSize(usize, usize);
+impl CursorSize {
+    pub fn stride(&self) -> usize {
+        4 * self.0
+    }
+    pub fn no_of_bytes(&self) -> usize {
+        self.stride() * self.1
+    }
+}
+pub struct Cursor {
+    changed : bool,
+    rgba : Vec<u8>,
+    size : CursorSize,
+    hotspot : Hotspot
+}
+impl Cursor {
+    pub fn new() -> Self {
+        Self {
+            changed: false,
+            rgba: Vec::new(),
+            size: CursorSize(0, 0),
+            hotspot: Hotspot(0, 0)
+        }
+    }
+
+    pub fn change_data(&mut self, rgba : Vec<u8>, size : CursorSize,
+                       hotspot : Hotspot) {
+        self.changed = true;
+        self.rgba = rgba;
+        self.size = size;
+        self.hotspot = hotspot;
+    }
+
+    pub fn rgba(&self) -> &Vec<u8> {
+        &self.rgba
+    }
+    pub fn hotspot(&self) -> Hotspot {
+        self.hotspot
+    }
+    pub fn size(&self) -> CursorSize {
+        self.size
+    }
+
+    pub fn handle_changed(&mut self) -> bool {
+        let ret = self.changed;
+        self.changed = false;
+        ret
+    }
 }
 
 struct CursorDifference {
@@ -197,22 +251,36 @@ impl CursorDifference {
 
 pub enum ProtocolEvent {
     ChangeDisplaySize(FbSize),
-    UpdateFramebuffer(SharedFb),
+    UpdateFramebuffer(Vec<u8>, FbSize),
+    UpdateCursor(Vec<u8>, CursorSize, Hotspot),
     SetTitle(String)
 }
 pub trait View {
+    type Output : ViewOutput;
+
     fn change_display_size_to(&self, size : FbSize) {
-        self.handle_event(ProtocolEvent::ChangeDisplaySize(size));
+        self.get_output().handle_event(ProtocolEvent::ChangeDisplaySize(size));
     }
-    fn update_framebuffer(&self, new_fb : SharedFb) {
-        self.handle_event(ProtocolEvent::UpdateFramebuffer(new_fb));
+    fn update_framebuffer(&self, new_fb_data : Vec<u8>, size : FbSize) {
+        self.get_output().update_framebuffer(new_fb_data, size);
     }
     fn set_title(&self, title : String) {
-        self.handle_event(ProtocolEvent::SetTitle(title));
+        self.get_output().handle_event(ProtocolEvent::SetTitle(title));
+    }
+
+    fn get_output(&self) -> &Self::Output;
+    fn get_events(&mut self) -> mpsc::Receiver<GuiEvent>;
+}
+pub trait ViewOutput : Send + Clone + 'static {
+    fn update_framebuffer(&self, new_fb_data : Vec<u8>, size : FbSize) {
+        self.handle_event(ProtocolEvent::UpdateFramebuffer(new_fb_data, size));
+    }
+    fn update_cursor(&self, cursor : &Cursor) {
+        self.handle_event(ProtocolEvent::UpdateCursor(
+                cursor.rgba().clone(), cursor.size(), cursor.hotspot()));
     }
 
     fn handle_event(&self, event : ProtocolEvent);
-    fn get_events(&mut self) -> mpsc::Receiver<GuiEvent>;
 }
 
 fn in_seconds(duration : Duration) -> f64 {
@@ -230,8 +298,10 @@ impl Stopwatch {
 
     pub fn take_measurement(&mut self, title : &str) {
         let now = Instant::now();
-        eprintln!("stopwatch: ‘{}’ {:?} ({:?})", title, now, 
-                  in_seconds(now.duration_since(self.most_recent_instant)));
+        let delay = in_seconds(now.duration_since(self.most_recent_instant));
+        if delay >= 0.001 {
+            eprintln!("stopwatch: ‘{}’ {:?} ({:?})", title, now, delay);
+        }
         self.most_recent_instant = now;
     }
 }
@@ -644,16 +714,20 @@ impl<V : View> RfbConnection<V> {
         -> Result<(), MainError>
     {
         //TODO non-blocking select between GUI and server? (use try_recv for mpsc)
-        //TODO first: decode everything here, then: use worker threads and *benchmark this*!
         
-        let decoder = DecodingMaster::new(self.framebuffer.clone());
+        let view_output_clone = self.view.get_output().clone();
+        let fb_updater = ThreadPool::new("fb-updater", 1, move || {
+            view_output_clone.clone()
+        });
+        let mut last_fb_update : Option<Future<MainError>> = None;
 
-        let mut jpeg_duration = Duration::from_secs(0);
-        let mut jpeg_times = 0;
+        let cursor = Arc::new(Mutex::new(Cursor::new()));
+        let decoder = DecodingMaster::new(
+            self.framebuffer.clone(),
+            cursor.clone());
 
         let (write_end_sender, write_end_receiver) = mpsc::channel();
         let write_end_sender_clone = write_end_sender.clone();
-        let write_end_sender_clone_2 = write_end_sender.clone();
         self.write_end_sender = Some(write_end_sender);
         self.resize_fb(FbSize::new(server_init.width, server_init.height));
 
@@ -675,27 +749,13 @@ impl<V : View> RfbConnection<V> {
                     .unwrap_or(());
             }
         });
-        //causes the server to respond more often
-//        std::thread::spawn(move || {
-//            loop {
-//                std::thread::sleep(Duration::from_millis(2));
-//                write_end_sender_clone_2.send(RfbWriteEvent::GuiEvent(
-//                        GuiEvent::Keyboard {
-//                            key: 0x20,
-//                            down: false
-//                        })).unwrap_or(());
-//            }
-//        });
 
         self.send_fb_update_request(false);
-//        self.write_end().send(RfbWriteEvent::Fence {
-//            flags: rfb::FENCE_REQUEST | rfb::FENCE_SYNC_NEXT,
-//            payload: Vec::new()
-//        }).unwrap_or(());
-        let start = Instant::now();
+        let _start = Instant::now();
 
         let mut fb_lock = None;
         let mut maybe_new_fb_size = None;
+        let mut area = 0.0;
 
         let mut in_1_second = Instant::now() + Duration::from_secs(1);
         let mut fps : f64 = 0.0;
@@ -709,7 +769,7 @@ impl<V : View> RfbConnection<V> {
             }
             //TODO do not block when waiting for the FramebufferUpdate
 
-            stopwatch.take_measurement("waiting for update");
+            stopwatch.take_measurement("waiting for packet");
             let before_waiting_for_fb_update = Instant::now();
             let server_packet = self.parse_packet::<rfb::ServerToClient>()?;
             time_spent_waiting += Instant::now().duration_since(
@@ -723,14 +783,44 @@ impl<V : View> RfbConnection<V> {
 //                      in_seconds(Instant::now().duration_since(
 //                              before_waiting_for_fb_update)),
 //                      message_type,
-//                      in_seconds(Instant::now().duration_since(start)));
+//                      in_seconds(Instant::now().duration_since(_start)));
+            stopwatch.take_measurement("got packet");
             match server_packet {
                 rfb::ServerToClient::FramebufferUpdate(update) => {
-                    stopwatch.take_measurement("update");
-                    let mut area = 0.0;
+                    if fb_lock.is_some() {
+                        last_fb_update.take().unwrap().wait()?;
+                        drop(fb_lock.take());
+                    }
+
+                    if self.config.benchmark {
+                        let fb_area = self.fb_size().width as f64
+                            * self.fb_size().height as f64;
+                        fps += area / fb_area;
+                        area = 0.0;
+                        if Instant::now() >= in_1_second {
+                            let fps_without_waiting = 
+                                fps / (1.0 - in_seconds(time_spent_waiting));
+                            let fps_without_waiting = fps_without_waiting.round();
+                            println!("{} {}", fps.round(), 
+                                     fps_without_waiting);
+                            ::std::io::Write::flush(
+                                &mut ::std::io::stdout()).unwrap();
+                            fps = 0.0;
+                            time_spent_waiting = Duration::from_secs(0);
+                            in_1_second += Duration::from_secs(1);
+                        }
+                    }
+
+                    if let Some(new_fb_size) = maybe_new_fb_size {
+                        self.resize_fb(new_fb_size);
+                        maybe_new_fb_size = None;
+                    }
 
                     //TODO not required if continuous updates are enabled
 //                    self.send_fb_update_request(true);
+
+                    stopwatch.take_measurement(
+                        "before reading update (after finalizing decoding)");
 
                     fb_lock = Some(decoder.lock_framebuffer());
 
@@ -747,9 +837,7 @@ impl<V : View> RfbConnection<V> {
                                 fb_lock.as_ref().unwrap(), 
                                 &decoder, 
                                 rectangle, 
-                                &mut time_spent_waiting, 
-                                &mut jpeg_duration, 
-                                &mut jpeg_times)?;
+                                &mut time_spent_waiting)?;
                         if let Some(new_fb_size) = new_fb_size {
                             maybe_new_fb_size = Some(new_fb_size);
                         }
@@ -757,38 +845,35 @@ impl<V : View> RfbConnection<V> {
                             break;
                         }
                     }
-//                    eprintln!("decoding took {}", in_seconds(
-//                            Instant::now().duration_since(_before_decoding)));
-                    decoder.finish(fb_lock.take().unwrap())?;
 
-                    if self.config.benchmark {
-                        let fb_area = self.fb_size().width as f64
-                            * self.fb_size().height as f64;
-                        fps += area / fb_area;
-                        if Instant::now() >= in_1_second {
-                            let fps_without_waiting = 
-                                fps / (1.0 - in_seconds(time_spent_waiting));
-                            let fps_without_waiting = fps_without_waiting.round();
-                            println!("{} {} {}", fps.round(), fps_without_waiting,
-                                     jpeg_times as f64 / in_seconds(jpeg_duration));
-                            ::std::io::Write::flush(
-                                &mut ::std::io::stdout()).unwrap();
-                            fps = 0.0;
-                            time_spent_waiting = Duration::from_secs(0);
-                            in_1_second += Duration::from_secs(1);
-
-                            jpeg_duration = Duration::from_secs(0);
-                            jpeg_times = 0;
+                    let decoding = decoder.finish();
+                    let fb_raw_parts = fb_lock.as_ref().unwrap()
+                        .get_raw_parts();
+                    let cursor = cursor.clone();
+                    last_fb_update = Some(fb_updater.spawn_fn(move |view| {
+//                        let mut stopwatch = Stopwatch::new();
+//                        stopwatch.take_measurement("before decoding");
+                        decoding.wait()?;
+//                        stopwatch.take_measurement("after decoding");
+                        let size = fb_raw_parts.1.no_of_bytes();
+                        let mut copy = Vec::with_capacity(size);
+                        unsafe {
+                            copy.set_len(size);
                         }
-                    }
+                        let mut fb = unsafe {
+                            FbPointerSlice::from_raw_parts(fb_raw_parts)
+                        };
+                        (&mut copy[..]).copy_from_slice(fb.bytes());
+                        view.update_framebuffer(copy, fb.size());
 
-                    if let Some(new_fb_size) = maybe_new_fb_size {
-                        self.resize_fb(new_fb_size);
-                        maybe_new_fb_size = None;
-                    }
-                    stopwatch.take_measurement("updating framebuffer");
-                    let fb_reference = &self.framebuffer;
-                    self.view.update_framebuffer(fb_reference.clone());
+                        let mut cursor = cursor.lock().unwrap();
+                        if cursor.handle_changed() {
+                            view.update_cursor(&cursor)
+                        }
+
+                        Ok(())
+                    }));
+                    stopwatch.take_measurement("after reading update");
                 },
                 rfb::ServerToClient::Fence(fence) => { 
 //                    eprintln!("fence: {:?}", fence);
@@ -814,9 +899,7 @@ impl<V : View> RfbConnection<V> {
                             fb_lock : &FbLock<'a>,
                             decoder : &DecodingMaster,
                             rectangle : rfb::Rectangle,
-                            time_spent_waiting : &mut Duration,
-                            jpeg_duration : &mut Duration,
-                            jpeg_times : &mut u32)
+                            time_spent_waiting : &mut Duration)
         -> Result<(bool, Option<FbSize>), MainError>
     {
         match rectangle.payload {
@@ -906,33 +989,21 @@ impl<V : View> RfbConnection<V> {
                         decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
                                 &rectangle,
                                 EncodingMethod::Jpeg(bytes)));
-
-                        *jpeg_duration += Instant::now().duration_since(start);
-                        *jpeg_times += 1;
                     }
                 }
             },
-            rfb::RectanglePayload::CursorRectangle(_rect) => {
+            rfb::RectanglePayload::CursorRectangle(_) => {
                 //TODO parse rectangle.size
-                //TODO refactor out a BitmapParser from PaletteFilter + colors = 2
-//                                let cursor_size = FbSize::new(rectangle.width, 
-//                                                              rectangle.height);
-//                                let mut cursor = Framebuffer::new();
-//                                cursor.resize(cursor_size);
-//
-//                                let no_of_pixel_bytes = cursor_size.no_of_pixels()
-//                                    * PIXEL_FORMAT_BYTES_PER_PIXEL;
-//                                let src_pixels = Vec::with_capacity(no_of_pixel_bytes);
-//                                unsafe {
-//                                    src_pixels.set_len(no_of_pixels);
-//                                }
-//                                ::std::io::Read::read_exact(&mut self.socket, &mut src_pixels[..])?;
-//
-//                                let pixels = Vec::with_capacity(
-//                                    cursor_size.no_of_pixels() * CURSOR_BYTES_PER_PIXEL);
-//
-
-//                                unimplemented!()
+                let no_of_pixel_bytes = rectangle.width * rectangle.height
+                    * PIXEL_FORMAT_BYTES_PER_PIXEL;
+                let bitmask_stride = (rectangle.width + 7) / 8;
+                decoder.accept(fb_lock, DecodingJob::rect_from_rfb(
+                        &rectangle,
+                        EncodingMethod::CursorBgrx {
+                            pixels: self.read_bytes(no_of_pixel_bytes)?,
+                            bitmask: self.read_bytes(
+                                bitmask_stride * rectangle.height)?
+                        }));
             },
             rfb::RectanglePayload::DesktopSizeRectangle(_) => {
 //                                eprintln!("received[{}] ‘{:?}’", server_address, rectangle);
