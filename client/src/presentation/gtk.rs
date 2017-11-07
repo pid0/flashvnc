@@ -1,5 +1,6 @@
 use ::{GuiEvent,ProtocolEvent,socket_thread_main,View,ConnectionConfig,
-       MainError,FbSize,EncodingQuality,ViewOutput};
+       MainError,FbSize,EncodingQuality,ViewOutput,PixelFormat};
+use presentation::menu::{Menu,MenuActionHandler,DrawingContext};
 
 use gtk;
 use gdk;
@@ -20,15 +21,6 @@ use gdk_pixbuf::Pixbuf;
 use std::sync::mpsc;
 use std::ops::Deref;
 
-const KEY_F1 : u32 = 0xffbe;
-const KEY_F2 : u32 = 0xffbf;
-const KEY_F3 : u32 = 0xffc0;
-const KEY_F4 : u32 = 0xffc1;
-const KEY_F5 : u32 = 0xffc2;
-const KEY_F6 : u32 = 0xffc3;
-const KEY_F8 : u32 = 0xffc5;
-const KEY_F11 : u32 = 0xffc8;
-
 const COLORSPACE_RGB : i32 = 0;
 
 struct GtkContext {
@@ -36,9 +28,8 @@ struct GtkContext {
     window : gtk::Window,
     drawing_area : gtk::DrawingArea,
     pixbuf : Pixbuf,
-    relative_mouse_mode : bool,
-    f8_pressed : bool,
-    fullscreen : bool
+    menu : Menu<GtkMenuActionHandler>,
+    current_size : Option<FbSize>
 }
 static mut GTK_CONTEXT : Option<GtkContext> = None;
 fn gtk_context() -> &'static mut GtkContext {
@@ -56,14 +47,16 @@ fn handle_protocol_event(event : ProtocolEvent) {
         ProtocolEvent::ChangeDisplaySize(size) => {
             context.window.resize(size.width as i32,
                                   size.height as i32);
+            context.current_size = Some(size);
         },
-        ProtocolEvent::UpdateFramebuffer(new_fb_data, size) => {
+        ProtocolEvent::UpdateFramebuffer(rgb, size) => {
 //            eprintln!("updating GUI framebuffer {:?}", ::std::time::Instant::now());
-            let pixbuf = Pixbuf::new_from_vec(new_fb_data, COLORSPACE_RGB,
+            let stride = size.width * 3;
+            let pixbuf = Pixbuf::new_from_vec(rgb, COLORSPACE_RGB,
                                               false, 8, 
                                               size.width as i32,
                                               size.height as i32,
-                                              size.stride() as i32);
+                                              stride as i32);
             context.pixbuf = pixbuf;
             drawing_area.queue_draw();
 //            eprintln!("updated GUI framebuffer {:?}", ::std::time::Instant::now());
@@ -103,10 +96,13 @@ impl View for GtkView {
     fn get_output(&self) -> &GtkViewOutput {
         &self.output
     }
+    fn desired_pixel_format() -> PixelFormat {
+        PixelFormat::Rgb
+    }
 }
 #[derive(Clone)]
 struct GtkViewOutput {
-    events_out : mpsc::Sender<ProtocolEvent>
+    events_out : mpsc::SyncSender<ProtocolEvent>
 }
 impl ViewOutput for GtkViewOutput {
     fn handle_event(&self, event : ProtocolEvent) {
@@ -146,42 +142,38 @@ fn show_fatal_error(error_string : String) {
     });
 }
 
-fn draw_menu(context : &'static mut GtkContext, cr : &cairo::Context,
-             width : f64, _height : f64) {
-    let item_width = width * 0.9;
-    let item_height = 35.0;
-    let item_spacing = 40.0;
+struct GtkMenuActionHandler;
+impl MenuActionHandler for GtkMenuActionHandler {
+    fn set_encoding_quality(&mut self, quality : EncodingQuality) {
+        connection_out().send(GuiEvent::SetEncodingQuality(
+                quality)).unwrap_or(());
+    }
+    fn set_fullscreen(&mut self) {
+        gtk_context().window.fullscreen();
+    }
+    fn unset_fullscreen(&mut self) {
+        gtk_context().window.unfullscreen();
+    }
+    fn start_relative_mouse_mode(&mut self) {
+        warp_cursor_to_center(&gtk_context().drawing_area);
+    }
+    fn stop_relative_mouse_mode(&mut self) { }
+}
 
-    for (i, &(text, on)) in [
-        ("F1: Encoding: Lossy, high quality", None),
-        ("F2: Encoding: Lossy, medium quality", None),
-        ("F3: Encoding: Lossy, medium, with interframe comparison", None),
-        ("F4: Encoding: Lossy, low quality", None),
-        ("F5: Encoding: Lossless", None),
-        ("F6: Relative mouse mode", Some(context.relative_mouse_mode)),
-        ("F11: Fullscreen", Some(context.fullscreen))
-    ].iter().enumerate() {
-        let y = (i as f64) * item_spacing;
-        cr.set_source_rgb(0.3, 0.6, 1.0);
-        cr.rectangle(0.0, y, item_width, item_height);
-        cr.fill();
-
-        cr.set_source_rgb(0.0, 0.0, 0.0);
-        cr.set_font_size(15.0);
-        cr.select_font_face("Sans", cairo::FontSlant::Normal, 
-                            cairo::FontWeight::Normal);
-        cr.move_to(5.0, y + item_spacing / 2.0);
-
-        if let Some(on) = on {
-            cr.show_text(&format!("[{}] {}",
-                                  if on {
-                                      "x"
-                                  } else {
-                                      " "
-                                  }, text));
-        } else {
-            cr.show_text(text);
-        }
+struct CairoContext<'a>(&'a cairo::Context);
+impl<'a> DrawingContext for CairoContext<'a> {
+    fn fill_background_rect(&mut self, x : f64, y : f64, w : f64, h : f64) {
+        self.0.set_source_rgb(0.3, 0.6, 1.0);
+        self.0.rectangle(x, y, w, h);
+        self.0.fill();
+    }
+    fn draw_text(&mut self, x : f64, y : f64, text : &str) {
+        self.0.set_source_rgb(0.0, 0.0, 0.0);
+        self.0.set_font_size(15.0);
+        self.0.select_font_face("Sans", cairo::FontSlant::Normal, 
+                                cairo::FontWeight::Normal);
+        self.0.move_to(x, y);
+        self.0.show_text(text);
     }
 }
 
@@ -265,7 +257,7 @@ fn warp_cursor_to_center(widget : &gtk::DrawingArea) {
             center_x, center_y));
 }
 
-fn compute_buttons_state<E>(e : &E) -> (u8, u8)
+fn compute_buttons_state<E>(e : &E) -> u8
     where E : PointerEvent 
 {
     let gdk_state = e.get_state();
@@ -282,8 +274,6 @@ fn compute_buttons_state<E>(e : &E) -> (u8, u8)
         }
     }
 
-    let original_buttons_state = buttons_state;
-
     if let Some((button, state)) = e.changed_button() {
         if state == ButtonState::Down {
             buttons_state |= 1 << (button - 1);
@@ -293,7 +283,7 @@ fn compute_buttons_state<E>(e : &E) -> (u8, u8)
         }
     }
 
-    (original_buttons_state, buttons_state)
+    buttons_state
 }
 
 fn handle_mouse_input<E>(widget : &gtk::DrawingArea, e : &E) -> gtk::Inhibit 
@@ -301,14 +291,10 @@ fn handle_mouse_input<E>(widget : &gtk::DrawingArea, e : &E) -> gtk::Inhibit
 {
     let (x, y) = e.get_position();
 
-    let (buttons_state_before_event, buttons_state) = compute_buttons_state(e);
-    let buttons_state = if e.is_scroll() {
-        buttons_state_before_event
-    } else {
-        buttons_state
-    };
+    let buttons_state = compute_buttons_state(e);
+    let buttons_without_scrolling = buttons_state & !0x18;
 
-    if gtk_context().relative_mouse_mode {
+    if gtk_context().menu.relative_mouse_mode() {
         let center_x = widget.get_allocated_width() / 2;
         let center_y = widget.get_allocated_height() / 2;
         let center_x = center_x as f64;
@@ -324,6 +310,14 @@ fn handle_mouse_input<E>(widget : &gtk::DrawingArea, e : &E) -> gtk::Inhibit
                 }).unwrap_or(());
             warp_cursor_to_center(widget);
         }
+        if e.is_scroll() {
+            connection_out().send(
+                GuiEvent::RelativePointer {
+                    state: buttons_without_scrolling,
+                    dx: 0.0,
+                    dy: 0.0
+                }).unwrap_or(());
+        }
     } else {
         connection_out().send(
             GuiEvent::Pointer {
@@ -331,70 +325,29 @@ fn handle_mouse_input<E>(widget : &gtk::DrawingArea, e : &E) -> gtk::Inhibit
                 x: x as i32,
                 y: y as i32
             }).unwrap_or(());
+        if e.is_scroll() {
+            connection_out().send(
+                GuiEvent::Pointer {
+                    state: buttons_without_scrolling,
+                    x: x as i32,
+                    y: y as i32
+                }).unwrap_or(());
+        }
     }
 
     gtk::Inhibit(true)
 }
 
-fn handle_keyboard_input(widget : &gtk::DrawingArea, e : &gdk::EventKey) 
+fn handle_keyboard_input(_widget : &gtk::DrawingArea, e : &gdk::EventKey) 
     -> gtk::Inhibit 
 {
     let context = gtk_context();
     let key = e.get_keyval();
     let press = e.get_event_type() == gdk::EventType::KeyPress;
 
-    if press {
-        let f8_pressed_now = key == KEY_F8;
-        let f8_was_pressed = context.f8_pressed;
-        if f8_was_pressed {
-            match key {
-                KEY_F1 => {
-                    connection_out().send(GuiEvent::SetEncodingQuality(
-                            EncodingQuality::LossyHigh)).unwrap_or(());
-                },
-                KEY_F2 => {
-                    connection_out().send(GuiEvent::SetEncodingQuality(
-                            EncodingQuality::LossyMedium)).unwrap_or(());
-                },
-                KEY_F3 => {
-                    connection_out().send(GuiEvent::SetEncodingQuality(
-                            EncodingQuality::LossyMediumInterframeComparison))
-                        .unwrap_or(());
-                },
-                KEY_F4 => {
-                    connection_out().send(GuiEvent::SetEncodingQuality(
-                            EncodingQuality::LossyLow)).unwrap_or(());
-                },
-                KEY_F5 => {
-                    connection_out().send(GuiEvent::SetEncodingQuality(
-                            EncodingQuality::Lossless)).unwrap_or(());
-                },
-                KEY_F6 => {
-                    context.relative_mouse_mode = !context.relative_mouse_mode;
-                    if context.relative_mouse_mode {
-                        warp_cursor_to_center(widget);
-                    }
-                },
-                KEY_F11 => {
-                    context.fullscreen = !context.fullscreen;
-                    if context.fullscreen {
-                        context.window.fullscreen();
-                    } else {
-                        context.window.unfullscreen();
-                    }
-                },
-                _ => { }
-            }
-            context.f8_pressed = false;
-        }
-        if f8_pressed_now {
-            context.f8_pressed = true;
-        }
-
-        if f8_was_pressed || f8_pressed_now {
-            context.drawing_area.queue_draw();
-            return gtk::Inhibit(true);
-        }
+    if press && context.menu.intercept_key_press(key) {
+        context.drawing_area.queue_draw();
+        return gtk::Inhibit(true);
     }
 
     connection_out().send(
@@ -409,6 +362,10 @@ fn handle_keyboard_input(widget : &gtk::DrawingArea, e : &gdk::EventKey)
 fn handle_resize_event(e : &gdk::EventConfigure) -> bool {
     let (width, height) = e.get_size();
     let size = FbSize::new(width as usize, height as usize);
+    let context = gtk_context();
+    if context.current_size.is_none() || context.current_size == Some(size) {
+        return false;
+    }
     connection_out().send(GuiEvent::Resized(size)).unwrap_or(());
     false
 }
@@ -439,8 +396,8 @@ pub fn run(config : ConnectionConfig) {
         cr.rectangle(0.0, 0.0, width, height);
         cr.fill();
 
-        if context.f8_pressed {
-            draw_menu(context, cr, width, height);
+        if context.menu.visible() {
+            context.menu.draw(&mut CairoContext(cr), width, height);
         }
 
 //        eprintln!("drawing GUI framebuffer {:?}", ::std::time::Instant::now());
@@ -483,7 +440,7 @@ pub fn run(config : ConnectionConfig) {
     area.set_can_focus(true);
 
     let (gui_events_tx, gui_events_rx) = mpsc::channel();
-    let (protocol_events_tx, protocol_events_rx) = mpsc::channel();
+    let (protocol_events_tx, protocol_events_rx) = mpsc::sync_channel(5);
     unsafe {
         CONNECTION_OUT = Some(gui_events_tx);
     }
@@ -495,9 +452,8 @@ pub fn run(config : ConnectionConfig) {
             drawing_area: area.clone(),
             pixbuf: Pixbuf::new_from_vec(
                     one_pixel_fb, COLORSPACE_RGB, false, 8, 1, 1, 3),
-            relative_mouse_mode: false,
-            f8_pressed: false,
-            fullscreen: false
+            menu: Menu::new(GtkMenuActionHandler { }),
+            current_size: None,
         });
     }
     let view = GtkView {

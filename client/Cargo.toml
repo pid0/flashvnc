@@ -9,6 +9,7 @@ build = "build.rs"
 gtk = "*"
 gdk-pixbuf = "*"
 glib = "*"
+sdl2 = "*"
 libc = "0.2"
 # this a dependency of only benchmark and listed here
 # due to a limitation in Cargo

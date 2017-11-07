@@ -1,10 +1,12 @@
-use ::{SharedFb,FbSize,MainError,Rgb,PIXEL_FORMAT_BYTES_PER_PIXEL,Framebuffer,
-       FbSlice,FbRawParts,FbPointerSlice,Cursor,CursorSize,Hotspot};
+use ::{SharedFb,FbSize,MainError,Bgrx,PIXEL_FORMAT_BYTES_PER_PIXEL,
+       FbSlice,FbAccess,Cursor,CursorSize,Hotspot,PixelFormat,
+       FB_PIXEL_FORMAT};
 use std::io;
 use protocol::rfb;
 
-use std::sync::{Arc,Mutex,RwLockWriteGuard};
+use std::sync::{Arc,Mutex};
 use std::cell::RefCell;
+use std::ptr;
 
 use tight::ZlibDecoder;
 use tight::jpeg::Decoder as JpegDecoder;
@@ -15,9 +17,9 @@ use infrastructure::BitBuffer;
 pub enum EncodingMethod {
     RawBgra(Vec<u8>),
     CopyFilter(TightData),
-    PaletteFilter(Vec<Rgb>, TightData),
+    PaletteFilter(Vec<Bgrx>, TightData),
     Jpeg(Vec<u8>),
-    Fill(Rgb),
+    Fill(Bgrx),
     CursorBgrx {
         pixels: Vec<u8>,
         bitmask: Vec<u8>
@@ -73,15 +75,6 @@ impl Bounds {
     }
 }
 
-pub struct FbLock<'a> {
-    lock : RwLockWriteGuard<'a, Framebuffer>
-}
-impl<'a> FbLock<'a> {
-    pub fn get_raw_parts(&self) -> FbRawParts {
-        self.lock.get_raw_parts()
-    }
-}
-
 struct Decoders {
     jpeg_decoder : JpegDecoder,
     zlib_decoder : ZlibDecoder
@@ -95,16 +88,24 @@ impl Decoders {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BufPointer(*const u8);
+unsafe impl Send for BufPointer { }
+#[derive(Clone, Copy)]
+struct MutBufPointer(*mut u8);
+unsafe impl Send for MutBufPointer { }
+
 type SharedCursor = Arc<Mutex<Cursor>>;
-type State = (Decoders, SharedCursor);
+type State = (Decoders, SharedFb, SharedCursor);
 
 type DecoderPool = ThreadPool<State>;
 
 pub struct DecodingMaster {
-    framebuffer : SharedFb,
     general_decoders : DecoderPool,
     zlib_decoders : [DecoderPool; 4],
-    futures : RefCell<Vec<Future<MainError>>>
+    futures : RefCell<Vec<Future<MainError>>>,
+    framebuffer : SharedFb,
+    no_of_threads : usize
 }
 impl DecodingMaster {
     pub fn new(fb : SharedFb, cursor : SharedCursor) -> Self {
@@ -112,48 +113,52 @@ impl DecodingMaster {
         let cursor_clone_2 = cursor.clone();
         let cursor_clone_3 = cursor.clone();
         let cursor_clone_4 = cursor.clone();
+        let fb_clone = fb.clone();
+        let fb_clone_1 = fb.clone();
+        let fb_clone_2 = fb.clone();
+        let fb_clone_3 = fb.clone();
+        let fb_clone_4 = fb.clone();
+        let no_of_threads = 4;
 
         let general_decoders = ThreadPool::new(
-            "general-decoder",
-            4, move || (Decoders::new(), cursor.clone()));
+            "general-decoder", no_of_threads,
+            move || (Decoders::new(), fb_clone.clone(), cursor.clone()));
         let zlib_decoders = [
             ThreadPool::new("zlib-decoder-1", 1, move ||
-                            (Decoders::new(), cursor_clone_1.clone())),
+                            (Decoders::new(), fb_clone_1.clone(), 
+                             cursor_clone_1.clone())),
             ThreadPool::new("zlib-decoder-2", 1, move ||
-                            (Decoders::new(), cursor_clone_2.clone())),
+                            (Decoders::new(), fb_clone_2.clone(),
+                            cursor_clone_2.clone())),
             ThreadPool::new("zlib-decoder-3", 1, move ||
-                            (Decoders::new(), cursor_clone_3.clone())),
+                            (Decoders::new(), fb_clone_3.clone(),
+                            cursor_clone_3.clone())),
             ThreadPool::new("zlib-decoder-4", 1, move ||
-                            (Decoders::new(), cursor_clone_4.clone()))];
+                            (Decoders::new(), fb_clone_4.clone(),
+                            cursor_clone_4.clone()))];
 
         Self {
-            framebuffer: fb,
             general_decoders: general_decoders,
             zlib_decoders: zlib_decoders,
-            futures: RefCell::new(Vec::with_capacity(20))
+            futures: RefCell::new(Vec::with_capacity(20)),
+            framebuffer: fb,
+            no_of_threads: no_of_threads
         }
     }
 
-    pub fn lock_framebuffer(&self) -> FbLock {
-        FbLock {
-            lock: self.framebuffer.write().unwrap()
-        }
-    }
-
-    fn spawn_job(&self, pool : &DecoderPool, fb_lock : &FbLock,
+    fn spawn_job(&self, pool : &DecoderPool,
                  bounds : Bounds, method : EncodingMethod) {
-        let fb_raw_parts = fb_lock.get_raw_parts();
         self.futures.borrow_mut().push(pool.spawn_fn(
-                move |&mut (ref mut decoders, ref mut cursor)| { 
+                move |&mut (ref mut decoders, ref fb, ref mut cursor)| {
                     decode(
-                        fb_raw_parts, &cursor,
+                        fb, &cursor,
                         &mut decoders.zlib_decoder,
                         &mut decoders.jpeg_decoder,
                         bounds, method) 
                 }));
     }
 
-    pub fn accept(&self, fb_lock : &FbLock, job : DecodingJob) {
+    pub fn accept(&self, job : DecodingJob) {
         use DecodingJob::*;
         use EncodingMethod::*;
         use TightData::*;
@@ -163,22 +168,22 @@ impl DecodingMaster {
                 match method {
                     CopyFilter(CompressedRgb { stream_no, bytes: _ }) => {
                         self.spawn_job(&self.zlib_decoders[stream_no],
-                                       fb_lock, bounds, method);
+                                       bounds, method);
                     },
                     PaletteFilter(_, CompressedRgb { stream_no, bytes: _}) => {
                         self.spawn_job(&self.zlib_decoders[stream_no],
-                                       fb_lock, bounds, method);
+                                       bounds, method);
                     },
                     _ => {
                         self.spawn_job(&self.general_decoders,
-                                       fb_lock, bounds, method);
+                                       bounds, method);
                     }
                 }
             },
             ResetZlib(stream_number) => {
                 let pool = &self.zlib_decoders[stream_number];
                 self.futures.borrow_mut().push(pool.spawn_fn(
-                        |&mut (ref mut decoders, _)| { 
+                        |&mut (ref mut decoders, _, _)| { 
                             decoders.zlib_decoder.reset(); 
                             Ok(()) 
                         }));
@@ -191,17 +196,85 @@ impl DecodingMaster {
         let ret = FutureCollection::new(futures.drain(..).collect());
         ret
     }
+
+    pub fn convert_or_copy_fb(&mut self, dest_format : PixelFormat)
+        -> (Vec<u8>, FbSize)
+    {
+        let fb = self.framebuffer.lock(FbAccess::Reading);
+        let size = fb.size();
+
+        let pixels = size.no_of_pixels();
+        let pixels_for_one = pixels / self.no_of_threads;
+        let surplus = pixels % self.no_of_threads;
+        let pixels_for_last = pixels_for_one + surplus;
+
+        let dst_len = pixels * dest_format.bytes_per_pixel();
+        let mut dst = Vec::with_capacity(dst_len);
+        unsafe {
+            dst.set_len(dst_len);
+        }
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = fb.data().as_ptr();
+
+        let func = match dest_format {
+            PixelFormat::NativeBgrx => copy,
+            PixelFormat::Rgb => bgrx_to_rgb
+        };
+
+        let futures : Vec<Future<()>> = (0..self.no_of_threads).map(|i| {
+            let src_offset = i * pixels_for_one
+                * FB_PIXEL_FORMAT.bytes_per_pixel;
+            let dst_offset = i * pixels_for_one * dest_format.bytes_per_pixel();
+            let src_start = BufPointer(unsafe { src_ptr.offset(
+                    src_offset as isize) });
+            let dst_start = MutBufPointer(unsafe { dst_ptr.offset(
+                    dst_offset as isize) });
+            let pixels = if i == self.no_of_threads - 1 {
+                pixels_for_last
+            } else {
+                pixels_for_one
+            };
+            self.general_decoders.spawn_fn(move |_| {
+                func(dst_start.0, src_start.0, pixels);
+                Ok(())
+            })
+        }).collect();
+
+        for future in futures {
+            future.wait().unwrap();
+        }
+
+        (dst, size)
+    }
 }
 
-fn decode(fb_parts : FbRawParts, cursor : &SharedCursor,
+fn bgrx_to_rgb(dst : *mut u8, src : *const u8, pixels : usize) {
+    unsafe {
+        let mut src_i = 0;
+        let mut dst_i = 0;
+        for _ in 0..pixels {
+            *dst.offset(dst_i + 0) = *src.offset(src_i + 2);
+            *dst.offset(dst_i + 1) = *src.offset(src_i + 1);
+            *dst.offset(dst_i + 2) = *src.offset(src_i + 0);
+            src_i += 4;
+            dst_i += 3;
+        }
+    }
+}
+fn copy(dst : *mut u8, src : *const u8, pixels : usize) {
+    unsafe {
+        ptr::copy_nonoverlapping(
+            src, dst, pixels * FB_PIXEL_FORMAT.bytes_per_pixel);
+    }
+}
+
+fn decode(fb : &SharedFb, cursor : &SharedCursor,
           zlib_decoder : &mut ZlibDecoder, jpeg_decoder : &mut JpegDecoder,
           bounds : Bounds,
           method : EncodingMethod) -> Result<(), MainError>
 {
     use EncodingMethod::*;
-    let mut fb = unsafe {
-        FbPointerSlice::from_raw_parts(fb_parts)
-    };
+    let mut fb = fb.lock(FbAccess::Decoding);
 
     match method {
         Fill(color) => {

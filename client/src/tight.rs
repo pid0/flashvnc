@@ -36,7 +36,7 @@ impl ZlibDecoder {
 
 pub mod jpeg {
     use std::fmt::{self,Display};
-    use ::Rgb;
+    use ::Bgrx;
     use std::ffi::CString;
     use libc::{c_int,c_void,size_t,c_uchar,c_char};
 
@@ -114,6 +114,7 @@ pub mod jpeg {
             }
         }
     }
+    unsafe impl Send for Decoder { }
 
     pub struct DecodedImage {
         state : DecoderState,
@@ -124,7 +125,7 @@ pub mod jpeg {
         //that the compiler knows line stays the same
         //also benchmark: remove setjmps
         line_number : usize,
-        line : Vec<Rgb>
+        line : Vec<Bgrx>
     }
     impl DecodedImage {
         fn new(state : DecoderState, width : usize, height : usize) -> Self {
@@ -164,7 +165,7 @@ pub mod jpeg {
             Ok(true)
         }
 
-        pub fn current_line(&self) -> &[Rgb] {
+        pub fn current_line(&self) -> &[Bgrx] {
             &self.line[..]
         }
     }

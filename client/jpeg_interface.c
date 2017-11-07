@@ -5,7 +5,7 @@
 #include <setjmp.h>
 #include <unistd.h>
 
-#define BYTES_PER_PIXEL 3
+#define BYTES_PER_PIXEL 4
 #define OK 0
 #define ERROR 1
 
@@ -54,13 +54,13 @@ int jpgint_dec_start(JpegState opaque_state, unsigned char const* src,
 //    jpeg_stdio_src(&state, stdin);
     jpeg_mem_src(jpeg_state, src, len);
     jpeg_read_header(jpeg_state, TRUE);
-    //TODO set output colorspace (see "Special color spaces", JCS_EXT_RGB)
+    jpeg_state->out_color_space = JCS_EXT_BGRX;
     jpeg_start_decompress(jpeg_state); //now: state.{output_width,output_height,output_components}
 
     state->in_stride = jpeg_state->output_width * jpeg_state->output_components;
-    unsigned char* scanline_buffer = malloc(state->in_stride);
-    assert(scanline_buffer != NULL);
-    state->scanline = scanline_buffer;
+//    unsigned char* scanline_buffer = malloc(state->in_stride);
+//    assert(scanline_buffer != NULL);
+//    state->scanline = scanline_buffer;
 
     return OK;
 }
@@ -73,17 +73,8 @@ int jpgint_dec_next_line(JpegState opaque_state, unsigned char* dest) {
         return ERROR;
     }
 
-    if(BYTES_PER_PIXEL == jpeg_state->output_components) {
-        jpeg_read_scanlines(jpeg_state, &dest, 1);
-    } else {
-        jpeg_read_scanlines(jpeg_state, &state->scanline, 1);
-        assert(jpeg_state->output_components == 1);
-        for(size_t i = 0; i < jpeg_state->output_width; ++i) {
-            dest[i * BYTES_PER_PIXEL + 0] = state->scanline[i];
-            dest[i * BYTES_PER_PIXEL + 1] = state->scanline[i];
-            dest[i * BYTES_PER_PIXEL + 2] = state->scanline[i];
-        }
-    }
+    assert(jpeg_state->output_components == BYTES_PER_PIXEL);
+    jpeg_read_scanlines(jpeg_state, &dest, 1);
 
     return OK;
 }

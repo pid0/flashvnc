@@ -244,7 +244,7 @@ fn main() {
     event_mask.insert(gdk::POINTER_MOTION_MASK);
     area.set_events(event_mask.bits() as i32);
 
-    window.set_size_request(800, 600);
+    window.set_size_request(1366, 768);
 
     println!("{}", unsafe { libc::getpid() });
 

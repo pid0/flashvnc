@@ -54,6 +54,9 @@ impl flashvnc::View for View {
     fn get_output(&self) -> &ViewOutput {
         unimplemented!()
     }
+    fn desired_pixel_format() -> flashvnc::PixelFormat {
+        flashvnc::PixelFormat::NativeBgrx
+    }
 }
 #[derive(Clone)]
 struct ViewOutput;
