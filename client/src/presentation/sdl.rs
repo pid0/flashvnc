@@ -18,7 +18,7 @@ use sdl2::rect::Rect;
 use sdl2::messagebox::{MESSAGEBOX_ERROR,show_simple_message_box};
 
 use std;
-use std::sync::{mpsc,Arc};
+use std::sync::{mpsc,Arc,Mutex};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::ops::Range;
@@ -46,7 +46,8 @@ fn handle_protocol_event(
     events : &EventPump,
     event : ProtocolEvent,
     menu : &Menu,
-    cursor : &mut Option<Cursor>) 
+    cursor : &mut Option<Cursor>,
+    fb_updated_tx : &mpsc::Sender<()>) 
 {
     match event {
         ProtocolEvent::ChangeDisplaySize(size) => {
@@ -73,6 +74,8 @@ fn handle_protocol_event(
                     size.height as f64);
             }
             surface.finish().unwrap();
+
+            fb_updated_tx.send(()).unwrap_or(());
         },
         ProtocolEvent::UpdateCursor(mut rgba, size, hotspot) => {
             if size.0 > 0 {
@@ -180,7 +183,8 @@ impl View for SdlView {
 #[derive(Clone)]
 struct SdlViewOutput {
     events_out : mpsc::SyncSender<ProtocolEvent>,
-    event_sys : Arc<AssertSend<EventSubsystem>>
+    event_sys : Arc<AssertSend<EventSubsystem>>,
+    fb_updated_rx : Arc<Mutex<mpsc::Receiver<()>>>
 }
 impl SdlViewOutput {
     fn wake_up_main_loop(&self) {
@@ -191,6 +195,10 @@ impl ViewOutput for SdlViewOutput {
     fn handle_event(&self, event : ProtocolEvent) {
         self.events_out.send(event).unwrap_or(());
         self.wake_up_main_loop();
+    }
+    fn update_framebuffer_sync(&self, fb_data : Vec<u8>, size : FbSize) {
+        self.update_framebuffer(fb_data, size);
+        self.fb_updated_rx.lock().unwrap().recv().unwrap_or(());
     }
 }
 
@@ -301,6 +309,7 @@ struct MainLoop {
     menu : Menu,
     protocol_events_rx: mpsc::Receiver<ProtocolEvent>,
     gui_events_tx: mpsc::Sender<GuiEvent>,
+    fb_updated_tx : mpsc::Sender<()>,
     cursor : Option<Cursor>
 }
 impl MainLoop {
@@ -311,7 +320,8 @@ impl MainLoop {
             handle_protocol_event(&mut self.window.borrow_mut(), 
                                   &self.events, event,
                                   &self.menu,
-                                  &mut self.cursor);
+                                  &mut self.cursor,
+                                  &self.fb_updated_tx);
         }
 
         match event {
@@ -477,11 +487,13 @@ pub fn run(config : ConnectionConfig) {
 
     let (gui_events_tx, gui_events_rx) = mpsc::channel();
     let (protocol_events_tx, protocol_events_rx) = mpsc::sync_channel(5);
+    let (fb_updated_tx, fb_updated_rx) = mpsc::channel();
     let view = SdlView {
         events_in: Some(gui_events_rx),
         output: SdlViewOutput {
             events_out: protocol_events_tx,
-            event_sys: Arc::new(AssertSend::new(event_sys))
+            event_sys: Arc::new(AssertSend::new(event_sys)),
+            fb_updated_rx: Arc::new(Mutex::new(fb_updated_rx))
         }
     };
     std::thread::spawn(move || {
@@ -507,6 +519,7 @@ pub fn run(config : ConnectionConfig) {
         menu: menu,
         protocol_events_rx: protocol_events_rx,
         gui_events_tx: gui_events_tx,
+        fb_updated_tx: fb_updated_tx,
         cursor: None
     };
 

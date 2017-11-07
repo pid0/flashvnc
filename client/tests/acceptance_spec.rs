@@ -64,6 +64,10 @@ impl flashvnc::ViewOutput for ViewOutput {
     fn handle_event(&self, _event : flashvnc::ProtocolEvent) {
         unimplemented!()
     }
+    fn update_framebuffer_sync(&self, fb_data : Vec<u8>,
+                               size : flashvnc::FbSize) {
+        unimplemented!()
+    }
 }
 
 struct Client {
@@ -85,7 +89,8 @@ impl Client {
             flashvnc::socket_thread_main(flashvnc::ConnectionConfig {
                 host: String::from("localhost"),
                 port: port,
-                benchmark: false
+                benchmark: false,
+                throttle: false
             }, view)
         });
 
@@ -197,7 +202,8 @@ fn should_stop_and_output_an_error_if_it_cant_write_to_the_server() {
     let error_message = flashvnc::handle_connection(flashvnc::ConnectionConfig {
             host: String::new(),
             port: 0,
-            benchmark: false
+            benchmark: false,
+            throttle: false
         }, client, view).unwrap_err().0;
     assert_that!(error_message.to_lowercase()).contains("connection");
     assert_that!(error_message.to_lowercase()).contains("can't write");

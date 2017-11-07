@@ -24,6 +24,7 @@ use std::io::{BufReader,BufWriter,Read,Write};
 //use std::io::{Read,Write};
 use std::net::{TcpStream,UdpSocket};
 use std::sync::mpsc;
+use std::collections::VecDeque;
 
 pub mod infrastructure;
 use infrastructure::thread_pool::{ThreadPool,Future,FutureCollection};
@@ -87,7 +88,8 @@ const FB_PIXEL_FORMAT : FbPixelFormat = FbPixelFormat {
 pub struct ConnectionConfig {
     pub host : String,
     pub port : u16,
-    pub benchmark : bool
+    pub benchmark : bool,
+    pub throttle : bool
 }
 
 pub enum EncodingQuality {
@@ -266,9 +268,6 @@ pub trait View {
     fn change_display_size_to(&self, size : FbSize) {
         self.get_output().handle_event(ProtocolEvent::ChangeDisplaySize(size));
     }
-    fn update_framebuffer(&self, fb_data : Vec<u8>, size : FbSize) {
-        self.get_output().update_framebuffer(fb_data, size);
-    }
     fn set_title(&self, title : String) {
         self.get_output().handle_event(ProtocolEvent::SetTitle(title));
     }
@@ -281,6 +280,7 @@ pub trait ViewOutput : Send + Clone + 'static {
     fn update_framebuffer(&self, fb_data : Vec<u8>, size : FbSize) {
         self.handle_event(ProtocolEvent::UpdateFramebuffer(fb_data, size));
     }
+    fn update_framebuffer_sync(&self, fb_data : Vec<u8>, size : FbSize);
     fn update_cursor(&self, cursor : &Cursor) {
         self.handle_event(ProtocolEvent::UpdateCursor(
                 cursor.rgba().clone(), cursor.size(), cursor.hotspot()));
@@ -317,6 +317,94 @@ impl NullStopwatch {
         Self { }
     }
     pub fn take_measurement(&mut self, _title : &str) { }
+}
+
+struct MovingAverage {
+    window_length : usize,
+    samples : VecDeque<Duration>,
+    mean : Duration
+}
+impl MovingAverage {
+    pub fn new(window_length : usize) -> Self {
+        Self {
+            window_length: window_length,
+            samples: VecDeque::new(),
+            mean: Duration::from_secs(0)
+        }
+    }
+
+    pub fn add(&mut self, new : Duration) {
+        self.samples.push_back(new);
+        if self.samples.len() > self.window_length {
+            self.mean = self.mean 
+                + (new / self.window_length as u32)
+                - (self.samples.pop_front().unwrap()
+                   / self.window_length as u32);
+        } else {
+            self.mean += new / self.window_length as u32;
+        }
+    }
+
+    pub fn get(&self) -> Duration {
+        self.mean
+    }
+}
+struct ThrottleController {
+    sleep_duration : Duration,
+    last_decrease : Instant,
+    delay_average : MovingAverage,
+    window_length : usize,
+    freeze_counter : usize
+}
+impl ThrottleController {
+    pub fn new() -> Self {
+        let window_length = 50;
+        Self {
+            sleep_duration: Duration::from_millis(0),
+            last_decrease: Instant::now(),
+            delay_average: MovingAverage::new(window_length),
+            window_length: window_length,
+            freeze_counter: 0
+        }
+    }
+
+    pub fn register_leftover_frame_delay(&mut self, delay : Duration) {
+        let threshold = Duration::from_millis(1);
+
+        self.delay_average.add(delay);
+        let delay = self.delay_average.get();
+
+        if self.freeze_counter != 0 {
+            self.freeze_counter -= 1;
+            return;
+        }
+
+        if delay > threshold {
+            self.sleep_duration += delay;
+            self.freeze_counter = self.window_length;
+            eprintln!("will sleep for {}", in_seconds(self.sleep_duration));
+        }
+
+        if Instant::now().duration_since(self.last_decrease) 
+            > Duration::from_millis(500)
+        {
+            let minus = if self.sleep_duration > Duration::from_millis(100) {
+                Duration::from_millis(5)
+            } else if self.sleep_duration > Duration::from_millis(50) {
+                Duration::from_millis(2)
+            } else {
+                Duration::from_millis(1)
+            };
+            if self.sleep_duration >= minus {
+                self.sleep_duration -= minus;
+            }
+            self.last_decrease = Instant::now();
+        }
+    }
+
+    pub fn sleep_duration(&self) -> Duration {
+        self.sleep_duration
+    }
 }
 
 pub struct MainError(pub String);
@@ -766,6 +854,8 @@ impl<V : View> RfbConnection<V> {
         let mut no_of_successive_full_updates = 0;
         let mut zero_copy_mode = false;
 
+        let mut throttle_controller = ThrottleController::new();
+
         let mut in_1_second = Instant::now() + Duration::from_secs(1);
         let mut fps : f64 = 0.0;
         let mut time_spent_waiting = Duration::from_secs(0);
@@ -795,8 +885,13 @@ impl<V : View> RfbConnection<V> {
             stopwatch.take_measurement("got packet");
             match server_packet {
                 rfb::ServerToClient::FramebufferUpdate(update) => {
+                    let start = Instant::now();
                     if last_fb_update.is_some() {
                         last_fb_update.take().unwrap().wait()?;
+                    }
+                    if self.config.throttle {
+                        throttle_controller.register_leftover_frame_delay(
+                            Instant::now().duration_since(start));
                     }
 
                     if self.config.benchmark {
@@ -857,6 +952,7 @@ impl<V : View> RfbConnection<V> {
                     let decoder = decoder.clone();
                     let cursor = cursor.clone();
                     let fb = self.framebuffer.clone();
+                    let throttle = self.config.throttle;
                     last_fb_update = Some(fb_updater.spawn_fn(move |view| {
 //                        let mut stopwatch = Stopwatch::new();
 //                        stopwatch.take_measurement("before decoding");
@@ -879,15 +975,26 @@ impl<V : View> RfbConnection<V> {
                                     .convert_or_copy_fb(desired_pixel_format)
                             }
                         };
-                        view.update_framebuffer(fb, size);
 
                         let mut cursor = cursor.lock().unwrap();
                         if cursor.handle_changed() {
                             view.update_cursor(&cursor)
                         }
 
+                        if !throttle {
+                            view.update_framebuffer(fb, size);
+                        } else {
+                            view.update_framebuffer_sync(fb, size);
+                        }
+
                         Ok(())
                     }));
+
+                    if self.config.throttle {
+                        std::thread::sleep(
+                            throttle_controller.sleep_duration());
+                    }
+
                     stopwatch.take_measurement("after reading update");
                 },
                 rfb::ServerToClient::Fence(fence) => { 
@@ -1080,7 +1187,8 @@ pub fn run(args : Vec<String>) {
     let config = ConnectionConfig {
         host: String::from(host_and_port[0]),
         port: u16::from_str(host_and_port[1]).unwrap(),
-        benchmark: options.contains(&"--benchmark")
+        benchmark: options.contains(&"--benchmark"),
+        throttle: options.contains(&"--throttle")
     };
 
     if options.contains(&"--sdl") {

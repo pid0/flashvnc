@@ -18,7 +18,7 @@ use gdk::prelude::ContextExt;
 
 use gdk_pixbuf::Pixbuf;
 
-use std::sync::mpsc;
+use std::sync::{mpsc,Arc,Mutex};
 use std::ops::Deref;
 
 const COLORSPACE_RGB : i32 = 0;
@@ -29,7 +29,9 @@ struct GtkContext {
     drawing_area : gtk::DrawingArea,
     pixbuf : Pixbuf,
     menu : Menu<GtkMenuActionHandler>,
-    current_size : Option<FbSize>
+    current_size : Option<FbSize>,
+    fb_updated_tx : mpsc::Sender<()>,
+    fb_updated : bool
 }
 static mut GTK_CONTEXT : Option<GtkContext> = None;
 fn gtk_context() -> &'static mut GtkContext {
@@ -51,6 +53,19 @@ fn handle_protocol_event(event : ProtocolEvent) {
         },
         ProtocolEvent::UpdateFramebuffer(rgb, size) => {
 //            eprintln!("updating GUI framebuffer {:?}", ::std::time::Instant::now());
+
+//            use libc::{rand,RAND_MAX};
+//            use std::time::Duration;
+//            let r_1 = unsafe { rand() } as f64 / RAND_MAX as f64;
+//            let r_2 = unsafe { rand() } as f64 / RAND_MAX as f64;
+//            if r_1 > 0.995 {
+//                std::thread::sleep(Duration::from_millis(
+//                        (50.0 + r_2 * 25.0) as u64));
+//            } else {
+//                std::thread::sleep(Duration::from_millis(
+//                        (1.0 + r_2 * 28.0) as u64));
+//            }
+
             let stride = size.width * 3;
             let pixbuf = Pixbuf::new_from_vec(rgb, COLORSPACE_RGB,
                                               false, 8, 
@@ -58,6 +73,7 @@ fn handle_protocol_event(event : ProtocolEvent) {
                                               size.height as i32,
                                               stride as i32);
             context.pixbuf = pixbuf;
+            context.fb_updated = true;
             drawing_area.queue_draw();
 //            eprintln!("updated GUI framebuffer {:?}", ::std::time::Instant::now());
         },
@@ -102,17 +118,28 @@ impl View for GtkView {
 }
 #[derive(Clone)]
 struct GtkViewOutput {
-    events_out : mpsc::SyncSender<ProtocolEvent>
+    events_out : mpsc::SyncSender<ProtocolEvent>,
+    fb_updated_receiver : Arc<Mutex<mpsc::Receiver<()>>>
 }
 impl ViewOutput for GtkViewOutput {
     fn handle_event(&self, event : ProtocolEvent) {
         self.events_out.send(event).unwrap();
         glib::idle_add(|| {
+            let mut i = 0;
             while let Ok(event) = gtk_context().connection_in.try_recv() {
-                handle_protocol_event(event)
+                handle_protocol_event(event);
+                i += 1;
+                if i >= 1 {
+                    break;
+                }
             }
             glib::Continue(false)
         });
+    }
+
+    fn update_framebuffer_sync(&self, fb_data : Vec<u8>, size : FbSize) {
+        self.update_framebuffer(fb_data, size);
+        self.fb_updated_receiver.lock().unwrap().recv().unwrap();
     }
 }
 
@@ -400,6 +427,11 @@ pub fn run(config : ConnectionConfig) {
             context.menu.draw(&mut CairoContext(cr), width, height);
         }
 
+        if context.fb_updated {
+            context.fb_updated = false;
+            context.fb_updated_tx.send(()).unwrap_or(());
+        }
+
 //        eprintln!("drawing GUI framebuffer {:?}", ::std::time::Instant::now());
         gtk::Inhibit(true)
     });
@@ -440,7 +472,8 @@ pub fn run(config : ConnectionConfig) {
     area.set_can_focus(true);
 
     let (gui_events_tx, gui_events_rx) = mpsc::channel();
-    let (protocol_events_tx, protocol_events_rx) = mpsc::sync_channel(5);
+    let (protocol_events_tx, protocol_events_rx) = mpsc::sync_channel(4);
+    let (fb_updated_tx, fb_updated_rx) = mpsc::channel();
     unsafe {
         CONNECTION_OUT = Some(gui_events_tx);
     }
@@ -454,12 +487,15 @@ pub fn run(config : ConnectionConfig) {
                     one_pixel_fb, COLORSPACE_RGB, false, 8, 1, 1, 3),
             menu: Menu::new(GtkMenuActionHandler { }),
             current_size: None,
+            fb_updated_tx: fb_updated_tx,
+            fb_updated: false
         });
     }
     let view = GtkView {
         events_in: Some(gui_events_rx),
         output: GtkViewOutput {
-            events_out: protocol_events_tx
+            events_out: protocol_events_tx,
+            fb_updated_receiver: Arc::new(Mutex::new(fb_updated_rx))
         }
     };
     std::thread::spawn(move || {
