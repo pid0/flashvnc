@@ -12,7 +12,7 @@ use sdl2::surface::{Surface,SurfaceRef};
 use sdl2::render::BlendMode;
 use sdl2::video::{Window,FullscreenType};
 use sdl2::mouse::{MouseUtil,Cursor,MouseWheelDirection};
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{self,Keycode};
 use sdl2::keyboard::Mod as KeyMod;
 use sdl2::rect::Rect;
 use sdl2::messagebox::{MESSAGEBOX_ERROR,show_simple_message_box};
@@ -25,7 +25,15 @@ use std::ops::Range;
 
 use presentation::x11_keysyms;
 
-const KEYSYM_TEXT_RANGE : Range<u32> = 0x20..0x100;
+const ASCII_TEXT_RANGE : Range<u32> = 0x20..0x100;
+const ASCII_DEL : u32 = 127;
+struct KeysymTextRange;
+impl KeysymTextRange {
+    pub fn contains(&self, keysym : u32) -> bool {
+        ASCII_TEXT_RANGE.contains(keysym) && keysym != ASCII_DEL
+    }
+}
+const KEYSYM_TEXT_RANGE : KeysymTextRange = KeysymTextRange{ };
 
 fn is_little_endian() -> bool {
     let n : u32 = 1;
@@ -39,6 +47,11 @@ fn pixel_format_rgba() -> PixelFormatEnum {
     } else {
         PixelFormatEnum::RGBA8888
     }
+}
+
+fn ctrl_pressed(key_mod : &KeyMod) -> bool {
+    key_mod.contains(keyboard::LCTRLMOD)
+        || key_mod.contains(keyboard::RCTRLMOD)
 }
 
 fn handle_protocol_event(
@@ -92,7 +105,7 @@ fn handle_protocol_event(
             }
         },
         ProtocolEvent::SetTitle(title) => {
-            //TODO — does not work
+            //TODO ‘—’ does not work
             //window.set_title(&format!("{} — flashvnc", title)).unwrap();
             window.set_title(&format!("{} --- flashvnc", title)).unwrap();
         },
@@ -213,7 +226,7 @@ fn show_fatal_error(error_string : String) {
         None).unwrap();
 }
 
-fn sdl_keycode_to_x11_keysym(keycode : Keycode, _key_mod : KeyMod) -> u32 {
+fn sdl_keycode_to_x11_keysym(keycode : Keycode, key_mod : KeyMod) -> u32 {
     use self::Keycode::*;
     use self::x11_keysyms::*;
     let keycode_num = keycode as i32 as u32;
@@ -286,6 +299,9 @@ fn sdl_keycode_to_x11_keysym(keycode : Keycode, _key_mod : KeyMod) -> u32 {
         Help => XK_Help,
         PrintScreen => XK_Print,
         Sysreq => XK_Sys_Req,
+        _ if ctrl_pressed(&key_mod) 
+            && keycode_num >= 'a' as u32 
+            && keycode_num <= 'z' as u32 => keycode_num - 0x60,
 //        _ if key_mod.contains(keyboard::LSHIFTMOD) 
 //            || key_mod.contains(keyboard::RSHIFTMOD) => {
 //            //TODO need some lib for this (must be layout dependent)
@@ -315,14 +331,6 @@ struct MainLoop {
 impl MainLoop {
     pub fn iterate(&mut self) -> bool {
         let event = self.events.wait_event();
-
-        while let Ok(event) = self.protocol_events_rx.try_recv() {
-            handle_protocol_event(&mut self.window.borrow_mut(), 
-                                  &self.events, event,
-                                  &self.menu,
-                                  &mut self.cursor,
-                                  &self.fb_updated_tx);
-        }
 
         match event {
             Event::Quit {..} => {
@@ -400,7 +408,9 @@ impl MainLoop {
                 };
                 let keysym = sdl_keycode_to_x11_keysym(keycode, keymod);
 
-                if !KEYSYM_TEXT_RANGE.contains(keycode as i32 as u32) {
+                if ctrl_pressed(&keymod) 
+                    || !KEYSYM_TEXT_RANGE.contains(keycode as i32 as u32)
+                {
                     self.handle_key_event(keysym, press);
                 }
 
@@ -434,6 +444,15 @@ impl MainLoop {
 
             _ => { }
         }
+
+        if let Ok(event) = self.protocol_events_rx.try_recv() {
+            handle_protocol_event(&mut self.window.borrow_mut(), 
+                                  &self.events, event,
+                                  &self.menu,
+                                  &mut self.cursor,
+                                  &self.fb_updated_tx);
+        }
+
         true
     }
 
