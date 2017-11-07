@@ -301,7 +301,7 @@ pub struct Client {
 }
 impl Client {
     pub fn start_with_args(host : &str, port : u16, args : &[&str],
-                           build : Build) 
+                           build : Build, wait : bool) 
         -> io::Result<Self>
     {
         let client_path = project_binary(build, "flashvnc");
@@ -311,15 +311,17 @@ impl Client {
             .stdout(Stdio::piped())
             .spawn()?;
 
-        assert!(Self::call_atspi_with_id(process.id(), &["wait"]).success(),
-            "no client");
+        if wait {
+            assert!(Self::call_atspi_with_id(process.id(), &["wait"]).success(),
+                "no client");
+        }
 
         Ok(Client {
             process: process
         })
     }
     pub fn start(host : &str, port : u16) -> io::Result<Self> {
-        Self::start_with_args(host, port, &[], Build::Debug)
+        Self::start_with_args(host, port, &[], Build::Debug, true)
     }
 
     pub fn stdout(&mut self) -> &mut ChildStdout {

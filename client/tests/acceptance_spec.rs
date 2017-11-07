@@ -64,8 +64,8 @@ impl flashvnc::ViewOutput for ViewOutput {
     fn handle_event(&self, _event : flashvnc::ProtocolEvent) {
         unimplemented!()
     }
-    fn update_framebuffer_sync(&self, fb_data : Vec<u8>,
-                               size : flashvnc::FbSize) {
+    fn update_framebuffer_sync(&self, _fb_data : Vec<u8>,
+                               _size : flashvnc::FbSize) {
         unimplemented!()
     }
 }

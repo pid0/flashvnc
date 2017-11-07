@@ -10,6 +10,7 @@ use common::end_to_end::{VncServer,Client,Build};
 
 fn main() {
     //TODO refactor this
+    let args : Vec<_> = std::env::args().skip(1).collect();
     let temp_dir = TempDir::new("flashvnc").unwrap();
     let server = VncServer::start_with_xstartup(temp_dir.path(), r#"
         displayNumber="${DISPLAY:1}"
@@ -18,8 +19,9 @@ fn main() {
         mouseserver "$mouseServerPort" &
         exec xterm -e bash --norc
     "#).unwrap();
+    let args : Vec<_> = args.iter().map(|s| &s[..]).collect();
     let mut client = Client::start_with_args("localhost", server.port(),
-        &[], Build::Debug).unwrap();
+        &args[..], Build::Release, false).unwrap();
 
     client.wait_for_termination();
 }

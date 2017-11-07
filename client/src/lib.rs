@@ -557,11 +557,12 @@ impl RfbWriteEnd {
                     previous_mouse_state = state;
                     if int_dx != 0 || int_dy != 0 || state_changed {
                         let mut message = Vec::new();
-                        //eprintln!("{:?} sending relative mouse message", Instant::now());
+//                        eprintln!("{:?} sending relative mouse message {} {}", 
+//                                  Instant::now(), int_dx, int_dy);
                         protocol::VirtualMouseServerMessage {
                             button_mask: state,
-                            dx: int_dx as i8,
-                            dy: int_dy as i8
+                            dx: int_dx as i16,
+                            dy: int_dy as i16
                         }.write(&mut message).unwrap();
                         self.mouse_server.send(&message[..])?;
                     }

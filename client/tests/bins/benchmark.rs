@@ -126,7 +126,7 @@ fn main() {
         } else {
             //TODO test both Debug and Release?
             let mut client = Client::start_with_args(&host, port,
-                &["--benchmark"], Build::Release).unwrap();
+                &["--benchmark"], Build::Release, false).unwrap();
 
             let mut fps_stream = io::BufReader::new(client.stdout());
             let mut line = String::new();

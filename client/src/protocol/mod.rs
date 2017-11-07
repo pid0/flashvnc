@@ -3,11 +3,11 @@ pub mod parsing;
 
 pub mod rfb;
 
-use self::parsing::primitive::{literal,u8p,i8p};
+use self::parsing::primitive::{literal,u8p,i16_be};
 
 packet! { VirtualMouseServerMessage:
     [ignored : [literal(u8p(), 0)] -> ()]
     [button_mask : [u8p()] -> u8]
-    [dx : [i8p()] -> i8]
-    [dy : [i8p()] -> i8]
+    [dx : [i16_be()] -> i16]
+    [dy : [i16_be()] -> i16]
 }

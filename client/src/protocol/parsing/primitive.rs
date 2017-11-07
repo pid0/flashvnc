@@ -116,6 +116,31 @@ pub fn u16_be() -> impl Parser<T = u16> {
     U16Be { }
 }
 
+struct I16Be;
+impl Parser for I16Be {
+    type T = i16;
+    fn parse<'a, I>(&self, mut input : I) -> ParseResult<i16, I>
+        where I : Input<'a>
+    {
+        let (bytes, rest) = input.read(2)?;
+        let byte0 = bytes[0] as u16;
+        let byte1 = bytes[1] as u16;
+        let value = byte1 | (byte0 << 8);
+        Ok((value as i16, rest))
+    }
+    fn write<O>(&self, output : &mut O, value : i16) -> WriteResult
+        where O : Output
+    {
+        let value = value as u16;
+        let byte0 = ((value & 0xff00) >> 8) as u8;
+        let byte1 = (value & 0x00ff) as u8;
+        output.write(&[byte0, byte1])
+    }
+}
+pub fn i16_be() -> impl Parser<T = i16> {
+    I16Be { }
+}
+
 struct U32Be;
 impl Parser for U32Be {
     type T = u32;
