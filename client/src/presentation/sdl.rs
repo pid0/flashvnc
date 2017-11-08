@@ -11,7 +11,7 @@ use sdl2::pixels::{Color,PixelFormatEnum};
 use sdl2::surface::{Surface,SurfaceRef};
 use sdl2::render::BlendMode;
 use sdl2::video::{Window,FullscreenType};
-use sdl2::mouse::{MouseUtil,Cursor,MouseWheelDirection};
+use sdl2::mouse::{MouseUtil,MouseState,Cursor,MouseWheelDirection,MouseButton};
 use sdl2::keyboard::{self,Keycode};
 use sdl2::keyboard::Mod as KeyMod;
 use sdl2::rect::Rect;
@@ -52,6 +52,35 @@ fn pixel_format_rgba() -> PixelFormatEnum {
 fn ctrl_pressed(key_mod : &KeyMod) -> bool {
     key_mod.contains(keyboard::LCTRLMOD)
         || key_mod.contains(keyboard::RCTRLMOD)
+}
+fn shift_pressed(key_mod : &KeyMod) -> bool {
+    key_mod.contains(keyboard::LSHIFTMOD)
+        || key_mod.contains(keyboard::RSHIFTMOD)
+}
+
+fn get_buttons_state(mouse : MouseState, scroll_y : i32) -> u8 {
+    let mut buttons_state = 0u8;
+    for (i, &pressed) in [
+        mouse.left(),
+        mouse.middle(),
+        mouse.right(),
+        scroll_y > 0,
+        scroll_y < 0].iter().enumerate()
+    {
+        if pressed {
+            buttons_state |= 1 << i;
+        }
+    }
+    buttons_state
+}
+
+fn updated_buttons_state(buttons_state : u8, button : MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => buttons_state | 0x1,
+        MouseButton::Middle => buttons_state | 0x2,
+        MouseButton::Right => buttons_state | 0x4,
+        _ => buttons_state
+    }
 }
 
 fn handle_protocol_event(
@@ -299,9 +328,11 @@ fn sdl_keycode_to_x11_keysym(keycode : Keycode, key_mod : KeyMod) -> u32 {
         Help => XK_Help,
         PrintScreen => XK_Print,
         Sysreq => XK_Sys_Req,
-        _ if ctrl_pressed(&key_mod) 
-            && keycode_num >= 'a' as u32 
-            && keycode_num <= 'z' as u32 => keycode_num - 0x60,
+        _ if shift_pressed(&key_mod)
+            && keycode_num >= 'a' as u32 && keycode_num <= 'z' as u32 =>
+        {
+            keycode_num - 0x20
+        },
 //        _ if key_mod.contains(keyboard::LSHIFTMOD) 
 //            || key_mod.contains(keyboard::RSHIFTMOD) => {
 //            //TODO need some lib for this (must be layout dependent)
@@ -326,7 +357,7 @@ struct MainLoop {
     protocol_events_rx: mpsc::Receiver<ProtocolEvent>,
     gui_events_tx: mpsc::Sender<GuiEvent>,
     fb_updated_tx : mpsc::Sender<()>,
-    cursor : Option<Cursor>
+    cursor : Option<Cursor>,
 }
 impl MainLoop {
     pub fn iterate(&mut self) -> bool {
@@ -349,19 +380,11 @@ impl MainLoop {
                 };
 
                 let mouse = self.events.mouse_state();
-                let mut buttons_state = 0u8;
-                for (i, &pressed) in [
-                    mouse.left(),
-                    mouse.middle(),
-                    mouse.right(),
-                    scroll_y > 0,
-                    scroll_y < 0].iter().enumerate()
-                {
-                    if pressed {
-                        buttons_state |= 1 << i;
-                    }
+                let mut buttons_state = get_buttons_state(mouse, scroll_y);
+                if let Event::MouseButtonDown { mouse_btn, .. } = event {
+                    buttons_state = updated_buttons_state(
+                        buttons_state, mouse_btn);
                 }
-
                 let buttons_state_without_scrolling = buttons_state & !0x18;
 
                 if self.menu.relative_mouse_mode() {
