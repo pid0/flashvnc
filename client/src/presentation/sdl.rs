@@ -385,6 +385,7 @@ impl MainLoop {
                 };
 
                 let mouse = self.events.mouse_state();
+                self.grab_or_ungrab_input(&mouse);
                 let mut buttons_state = get_buttons_state(mouse, scroll_y);
                 if let Event::MouseButtonDown { mouse_btn, .. } = event {
                     buttons_state = updated_buttons_state(
@@ -507,12 +508,25 @@ impl MainLoop {
             down: down
         }).unwrap_or(());
     }
+
+    fn grab_or_ungrab_input(&self, mouse : &MouseState) {
+        let mut window = self.window.borrow_mut();
+        let (w, h) = window.size();
+        if mouse.x() == 0 || mouse.x() == (w - 1) as i32
+            || mouse.y() == 0 || mouse.y() == (h - 1) as i32
+        {
+            window.set_grab(false);
+        } else {
+            window.set_grab(true);
+        }
+    }
 }
 
 
 pub fn run(config : ConnectionConfig) {
     let sdl_context = sdl2::init().unwrap();
     let video = sdl_context.video().unwrap();
+    sdl2::hint::set("SDL_GRAB_KEYBOARD", "1");
 
     video.text_input().start();
 
