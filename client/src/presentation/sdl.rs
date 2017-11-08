@@ -89,7 +89,8 @@ fn handle_protocol_event(
     event : ProtocolEvent,
     menu : &Menu,
     cursor : &mut Option<Cursor>,
-    fb_updated_tx : &mpsc::Sender<()>) 
+    fb_updated_tx : &mpsc::Sender<()>,
+    mouse : &MouseUtil) 
 {
     match event {
         ProtocolEvent::ChangeDisplaySize(size) => {
@@ -131,6 +132,9 @@ fn handle_protocol_event(
                         cursor_image, 
                         hotspot.0 as i32, hotspot.1 as i32).unwrap());
                 cursor.as_ref().unwrap().set();
+                mouse.show_cursor(true);
+            } else {
+                mouse.show_cursor(false);
             }
         },
         ProtocolEvent::SetTitle(title) => {
@@ -358,6 +362,7 @@ struct MainLoop {
     gui_events_tx: mpsc::Sender<GuiEvent>,
     fb_updated_tx : mpsc::Sender<()>,
     cursor : Option<Cursor>,
+    mouse : MouseUtil
 }
 impl MainLoop {
     pub fn iterate(&mut self) -> bool {
@@ -473,7 +478,8 @@ impl MainLoop {
                                   &self.events, event,
                                   &self.menu,
                                   &mut self.cursor,
-                                  &self.fb_updated_tx);
+                                  &self.fb_updated_tx,
+                                  &self.mouse);
         }
 
         true
@@ -562,7 +568,8 @@ pub fn run(config : ConnectionConfig) {
         protocol_events_rx: protocol_events_rx,
         gui_events_tx: gui_events_tx,
         fb_updated_tx: fb_updated_tx,
-        cursor: None
+        cursor: None,
+        mouse: sdl_context.mouse()
     };
 
     while main_loop.iterate() { }
